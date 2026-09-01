@@ -1,0 +1,9 @@
+<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="1.6">
+  <!-- AI_NOTE: アクティビティバー用の単色アイコン。VS Codeがテーマ色でtintする。
+       上の1ノードから下の2ノードへ分岐する簡易フローチャート。単純な circle+line で確実に描画させる。 -->
+  <line x1="12" y1="6" x2="6.5" y2="16"/>
+  <line x1="12" y1="6" x2="17.5" y2="16"/>
+  <circle cx="12" cy="5" r="2.4" fill="currentColor"/>
+  <circle cx="6" cy="18" r="2.4" fill="currentColor"/>
+  <circle cx="18" cy="18" r="2.4" fill="currentColor"/>
+</svg>

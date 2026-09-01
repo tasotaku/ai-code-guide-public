@@ -1,0 +1,38 @@
+# 同梱するのは: out/extension.js(esbuildバンドル) / python/** / mermaid.min.js のみ。
+# それ以外(ソース・開発物・node_modules)は除外して .vsix を小さく保つ。
+
+# --- 全体除外 ---
+src/**
+out/**
+node_modules/**
+tests/**
+research/**
+examples/**
+outputs/**
+output/**
+tmp/**
+scripts/**
+.claude/**
+.vscode/**
+.vscode-test/**
+.ai-code-guide/*.json
+.ai-code-guide/*.mjs
+**/*.ts
+**/*.map
+**/__pycache__/**
+esbuild.js
+tsconfig.json
+.eslintrc.json
+debug.sh
+install.sh
+release.sh
+*.vsix
+docs/**
+AGENTS.md
+
+# --- 同梱するものを再許可（除外より後に書く） ---
+!out/extension.js
+!out/uninstall.js
+!python/**
+!bin/**
+!node_modules/mermaid/dist/mermaid.min.js

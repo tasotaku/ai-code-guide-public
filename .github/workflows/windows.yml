@@ -1,0 +1,30 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: python scripts/audit_public.py worktree
+      - run: npm test
+      - name: Package VSIX through the public bootstrap
+        run: python bootstrap.py install --skip-vscode-install
+      - run: python scripts/audit_public.py vsix ai-code-guide.vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-code-guide-windows-vsix
+          path: ai-code-guide.vsix

@@ -1,0 +1,11 @@
+node_modules/
+out/
+*.vsix
+media/mermaid.min.js
+.vscode-test/
+research/sessions/
+__pycache__/
+*.pyc
+tests/temp/
+.DS_Store
+.acg-windows.json

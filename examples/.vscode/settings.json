@@ -1,0 +1,16 @@
+{
+  "workbench.startupEditor": "none",
+  "window.restoreWindows": "none",
+  "aiCodeGuide.autoShowOnOpen": true,
+  "aiCodeGuide.autoDescribe": false,
+  "aiCodeGuide.researchMode": true,
+  "aiCodeGuide.autoInlineAnnotations": true,
+  "aiCodeGuide.model": "gpt-5.6-sol",
+  "aiCodeGuide.chatModel": "gpt-5.6-sol",
+  "aiCodeGuide.inlineAnnotationModel": "gpt-5.6-sol",
+  "aiCodeGuide.subscriptionProvider": "codex",
+  "aiCodeGuide.symbolAnnotationPlacement": "hover",
+  "aiCodeGuide.showAnnotationStatusButtons": false,
+  "aiCodeGuide.autoAnnotateOnAiEdit": "off",
+  "editor.hover.delay": 0
+}

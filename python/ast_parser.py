@@ -720,6 +720,64 @@ def build_module_map(tree: ast.Module, lines: list[str]) -> dict[str, Any]:
     return {"nodes": nodes, "edges": edges, "relationships": relationships}
 
 
+def background_nodes(tree: ast.Module, lines: list[str], visible: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return lexical ownership for background generation without changing the visible graph."""
+    # AI_NOTE: カード用graphが省略する入れ子定義も拾い、親子の本体を二重生成しないための別配列にする。
+    if not lines or not tree.body:
+        return []
+    module_id = "__background_module__"
+    result: list[dict[str, Any]] = [{
+        "id": module_id, "kind": "block", "label": "モジュール直下",
+        "lineStart": 0, "lineEnd": len(lines) - 1, "scopeKey": "module",
+    }]
+    definitions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    known = {(n["kind"], n["lineStart"]): n for n in visible if n["kind"] in ("function", "class")}
+    siblings: dict[tuple[str, str], int] = {}
+
+    def walk(node: ast.AST, parent_id: str, parent_key: str) -> None:
+        # AI_NOTE: 条件分岐内の定義もlexical親に属させ、行番号を通常の安定キーに使わない。
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, definitions):
+                walk(child, parent_id, parent_key)
+                continue
+            kind = "class" if isinstance(child, ast.ClassDef) else "function"
+            key = (parent_key, child.name)
+            ordinal = siblings.get(key, 0)
+            siblings[key] = ordinal + 1
+            scope = f"{parent_key}/{kind}:{child.name}:{ordinal}"
+            existing = known.get((kind, child.lineno - 1))
+            first_line = min([child.lineno] + [d.lineno for d in child.decorator_list]) - 1
+            body_line = child.body[0].lineno - 1
+            # A one-line definition has no declaration-only line; exclude it entirely from the parent prompt.
+            header_end = body_line - 1 if body_line > child.lineno - 1 else first_line - 1
+            item = {
+                "id": existing["id"] if existing else f"__background_{scope}",
+                "kind": kind, "label": existing["label"] if existing else child.name,
+                "lineStart": first_line, "lineEnd": child.end_lineno - 1,
+                "headerEnd": header_end, "parent": parent_id, "scopeKey": scope,
+            }
+            result.append(item)
+            walk(child, item["id"], scope)
+
+    walk(tree, module_id, "module")
+    for item in visible:
+        if item["kind"] in ("function", "class", "entry"):
+            continue
+        # AI_NOTE: importカードが離れたimport間の定義までspanする場合は、module側に所有を戻す。
+        if item["label"].startswith("import ") and any(n["parent"] == module_id and n["lineStart"] <= item["lineEnd"] and n["lineEnd"] >= item["lineStart"] for n in result[1:]):
+            continue
+        result.append({**item, "parent": module_id, "scopeKey": f"module/{item['kind']}:{item['label']}"})
+    # AI_NOTE: トップレベルif/tryの内部定義はlexical keyを保ったまま、その処理カードへ表示所有を寄せる。
+    for item in result[1:]:
+        if item["kind"] not in ("function", "class") or item["parent"] != module_id:
+            continue
+        containers = [n for n in result[1:] if n["kind"] not in ("function", "class")
+                      and n["lineStart"] <= item["lineStart"] and item["lineEnd"] <= n["lineEnd"]]
+        if containers:
+            item["parent"] = min(containers, key=lambda n: n["lineEnd"] - n["lineStart"])["id"]
+    return result
+
+
 def extract_graph(source: str, target_func: str = "") -> dict[str, Any]:
     """関数の制御フローグラフを返す。target_func未指定ならモジュール構造マップを返す。"""
     lines = source.splitlines()
@@ -742,7 +800,10 @@ def extract_graph(source: str, target_func: str = "") -> dict[str, Any]:
         return {"nodes": [], "edges": []}
 
     # AI_NOTE: 関数未選択時はCFGでなくファイル構造マップを返す
-    return build_module_map(tree, lines)
+    # AI_NOTE: 既存カード形状は保ち、背景生成にだけ全lexical所有範囲を渡す。
+    result = build_module_map(tree, lines)
+    result["backgroundNodes"] = background_nodes(tree, lines, result["nodes"])
+    return result
 
 
 def extract_graph_detail(source: str) -> dict[str, Any]:
@@ -1079,6 +1140,23 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
         node.name for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+    import_bindings: dict[int, set[str]] = {}
+
+    def scope_imports(root: ast.AST) -> set[str]:
+        if id(root) in import_bindings:
+            return import_bindings[id(root)]
+        names: set[str] = set()
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            if current is not root and isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(current, (ast.Import, ast.ImportFrom)):
+                names.update(alias.asname or (alias.name.split(".")[0] if isinstance(current, ast.Import) else alias.name)
+                             for alias in current.names)
+            pending.extend(ast.iter_child_nodes(current))
+        import_bindings[id(root)] = names
+        return names
 
     def char_col(line: str, byte_col: int) -> int:
         return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
@@ -1086,10 +1164,23 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
     class SymbolVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.scope: list[str] = []
+            self.scope_nodes: list[ast.AST] = []
+            self.statement_nodes: list[ast.stmt] = []
             self.items: list[dict[str, Any]] = []
 
+        def visit(self, node: ast.AST) -> Any:
+            # AI_NOTE: 名称の代入根拠は最近傍statementの正確な範囲。改行式や文字列を字下げで推測しない。
+            if isinstance(node, ast.stmt):
+                self.statement_nodes.append(node)
+                try:
+                    return super().visit(node)
+                finally:
+                    self.statement_nodes.pop()
+            return super().visit(node)
+
         def add(self, node: ast.AST, name: str, kind: str, start_byte: int, end_byte: int,
-                identity: str | None = None) -> None:
+                identity: str | None = None, definition: bool = False,
+                evidence_node: ast.AST | None = None) -> None:
             parsed_line_index = getattr(node, "lineno", 1) - 1
             line_index = parsed_line_index - line_shift
             if (line_index < 0 or line_index >= len(source_lines)
@@ -1107,6 +1198,17 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
                 start, end = found, found + len(name)
             scope = ".".join(self.scope) or "<module>"
             semantic = identity or name
+            scope_node = evidence_node or (self.scope_nodes[-1] if self.scope_nodes else None)
+            scope_start = ((getattr(scope_node, "lineno", 1) - 1 - line_shift)
+                           if scope_node is not None else 0)
+            scope_end = ((getattr(scope_node, "end_lineno", len(source_lines)) - 1 - line_shift)
+                         if scope_node is not None else max(0, len(source_lines) - 1))
+            scope_start = max(0, min(scope_start, max(0, len(source_lines) - 1)))
+            scope_end = max(scope_start, min(scope_end, max(0, len(source_lines) - 1)))
+            statement = self.statement_nodes[-1] if self.statement_nodes else node
+            statement_start = max(0, getattr(statement, "lineno", 1) - 1 - line_shift)
+            statement_end = min(max(0, len(source_lines) - 1),
+                                getattr(statement, "end_lineno", statement_start + 1) - 1 - line_shift)
             self.items.append({
                 "key": f"{scope}|{kind}|{semantic}",
                 "name": name,
@@ -1117,6 +1219,14 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
                 "end_col": end,
                 "scope": scope,
                 "context": line.strip(),
+                "scope_start": scope_start,
+                "scope_end": scope_end,
+                "is_definition": definition,
+                "statement_start": statement_start,
+                "statement_end": max(statement_start, statement_end),
+                # AI_NOTE: 組込名を隠すimport(別名・star含む)は字句scopeごとに検出し、既知builtinsと誤認しない。
+                "import_shadowed": any(name in scope_imports(scope_node) or "*" in scope_imports(scope_node)
+                                       for scope_node in [tree, *self.scope_nodes]),
             })
 
         def definition_name(self, node: ast.AST, name: str, kind: str) -> None:
@@ -1132,21 +1242,25 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
             if start >= 0:
                 qualified = ".".join([*self.scope, name])
                 self.add(node, name, kind, len(line[:start].encode("utf-8")),
-                         len(line[:start + len(name)].encode("utf-8")), qualified)
+                         len(line[:start + len(name)].encode("utf-8")), qualified,
+                         definition=True, evidence_node=node)
 
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
             self.definition_name(node, node.name, "class")
             self.scope.append(node.name)
+            self.scope_nodes.append(node)
             for base in node.bases:
                 self.visit(base)
             for statement in node.body:
                 self.visit(statement)
             self.scope.pop()
+            self.scope_nodes.pop()
 
         def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
             kind = "method" if self.scope and self.scope[-1][:1].isupper() else "function"
             self.definition_name(node, node.name, kind)
             self.scope.append(node.name)
+            self.scope_nodes.append(node)
             self.visit(node.args)
             for decorator in node.decorator_list:
                 self.visit(decorator)
@@ -1155,6 +1269,7 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
             for statement in node.body:
                 self.visit(statement)
             self.scope.pop()
+            self.scope_nodes.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -1173,7 +1288,11 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
                 self.add(node.func, node.func.attr, "method", start, end, identity)
                 self.visit(node.func.value)
             else:
+                before = len(self.items)
                 self.visit(node.func)
+                # AI_NOTE: registry[key]() / factory()()などの呼出し先は名称だけでは静的解決しない。
+                for item in self.items[before:]:
+                    item["uncertain_call"] = True
             for arg in node.args:
                 self.visit(arg)
             for keyword in node.keywords:
@@ -1192,11 +1311,13 @@ def extract_symbol_occurrences(source: str) -> list[dict[str, Any]]:
         def visit_Name(self, node: ast.Name) -> None:
             kind = "class" if node.id in known_classes else "function" if node.id in known_functions else "variable"
             self.add(node, node.id, kind, node.col_offset,
-                     node.end_col_offset or node.col_offset + len(node.id), node.id)
+                     node.end_col_offset or node.col_offset + len(node.id), node.id,
+                     definition=isinstance(node.ctx, ast.Store))
 
         def visit_arg(self, node: ast.arg) -> None:
             self.add(node, node.arg, "variable", node.col_offset,
-                     node.end_col_offset or node.col_offset + len(node.arg), node.arg)
+                     node.end_col_offset or node.col_offset + len(node.arg), node.arg,
+                     definition=True)
             if node.annotation:
                 self.visit(node.annotation)
 

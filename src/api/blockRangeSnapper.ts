@@ -5,6 +5,11 @@ export interface StmtSpan {
     end: number;
 }
 
+export interface MeaningRange {
+    lineStart: number;
+    lineEnd: number;
+}
+
 // AI_NOTE: LLMが提案したサブブロックの行範囲(SubBlock.lineStart/lineEnd)は無検証だと
 // 複数行文の途中で切れて隙間ができる(annotationResolverと同じ問題)。ここでAST文境界にスナップし、
 // 連続性(隙間・重複なし)を機械的に強制する。annotationResolver.ts の設計を踏襲。
@@ -97,4 +102,23 @@ export function splitSingleBlockByTopLevelStatements(
             lineEnd: next ? next.start - 1 : funcEnd,
         };
     });
+}
+
+// AI_NOTE: 背景色は説明生成と独立した既定レイヤーなので、LLMを呼ばずAST直下文だけで
+// 関数全体を連続範囲へ分ける。短い関数も必ず1範囲を返し、詳細文はこの結果へ混ぜない。
+export function buildDefaultMeaningRanges(
+    stmts: StmtSpan[],
+    funcStart: number,
+    funcEnd: number,
+    sourceLines: string[],
+): MeaningRange[] {
+    const seed: SubBlock = {
+        label: "",
+        description: "",
+        lineStart: funcStart,
+        lineEnd: funcEnd,
+    };
+    return splitSingleBlockByTopLevelStatements(
+        [seed], stmts, funcStart, funcEnd, sourceLines,
+    ).map(({ lineStart, lineEnd }) => ({ lineStart, lineEnd }));
 }

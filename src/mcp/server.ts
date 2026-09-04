@@ -15,7 +15,7 @@ import { buildDetailAppShell } from "./detailApp";
 import { buildCodeEvidenceAppShell } from "./codeEvidenceApp";
 import { buildStandardAppShell } from "./standardApp";
 import { buildLauncherAppShell } from "./launcherApp";
-import { runUniqueInParallel } from "./launcherDispatch";
+import { languageIdForPath } from "../flowchart/languageSupport";
 
 type BridgeManifest = {
     version: number;
@@ -33,7 +33,7 @@ const SERVER_NAME = "ai-code-guide";
 // MCP App hosts may cache tool/resource metadata by server version. Keep this in
 // sync with package.json so a VS Code extension update cannot reuse stale ui://
 // registrations from an older bundled server.
-const SERVER_VERSION = "0.27.32";
+const SERVER_VERSION = "0.27.42";
 const STANDARD_APP_URI = "ui://ai-code-guide/code-locations-v8.html";
 // AI_NOTE: 旧ツール定義を保持する会話ホストにも、軽量化した現行UIを返す。
 const STANDARD_APP_URIS = [STANDARD_APP_URI, "ui://ai-code-guide/code-locations-v7.html", "ui://ai-code-guide/code-locations-v6.html", "ui://ai-code-guide/code-locations-v5.html", "ui://ai-code-guide/code-locations-v4.html", "ui://ai-code-guide/code-locations-v3.html", "ui://ai-code-guide/code-locations-v2.html", "ui://ai-code-guide/standard-view.html"] as const;
@@ -344,7 +344,7 @@ async function loadManifest(options: CliOptions, file?: string): Promise<BridgeM
     if (file && path.isAbsolute(file)) {
         const targetFile = existingFile(file, options.workspacePath);
         if (!targetFile) throw new Error(`Target file not found: ${file}`);
-        if (path.extname(targetFile) !== ".py") throw new Error(`Target file must be a Python file: ${file}`);
+        if (!languageIdForPath(targetFile)) throw new Error(`Target file must be Python, JavaScript, or TypeScript: ${file}`);
         const targetRoot = projectRootFor(targetFile);
         if (!targetRoot) {
             // markerのない単純なfolder workspaceは、既存接続がそのファイルを含む場合だけ再利用できる。
@@ -614,6 +614,7 @@ function standardFallbackText(body: BridgeResult): string {
 }
 
 function compactStandardBody(body: BridgeResult): BridgeResult {
+    // AI_NOTE: 全コード用背景はcard外領域も含むため、item単位に加えて共通範囲も残す。
     if (!body.standard || typeof body.standard !== "object") return body;
     const standard = body.standard as Record<string, unknown>;
     const items = Array.isArray(standard.items) ? standard.items : [];
@@ -623,7 +624,7 @@ function compactStandardBody(body: BridgeResult): BridgeResult {
     const compactItems = items.map((value) => {
         if (!value || typeof value !== "object") return value;
         const item = value as Record<string, unknown>;
-        return Object.fromEntries(["id", "kind", "label", "line", "lineEnd", "parent", "color", "expanded", "expansion"]
+        return Object.fromEntries(["id", "kind", "label", "line", "lineEnd", "parent", "color", "meaningRanges", "expanded", "expansion"]
             .filter((key) => item[key] !== undefined)
             .map((key) => [key, item[key]]));
     });
@@ -640,6 +641,7 @@ function compactStandardBody(body: BridgeResult): BridgeResult {
                     : [];
             }),
             items: compactItems,
+            ...(Array.isArray(standard.backgroundRanges) ? { backgroundRanges: standard.backgroundRanges } : {}),
         },
     };
 }
@@ -663,7 +665,7 @@ function projectFallbackText(body: BridgeResult): string {
     const project = body.project && typeof body.project === "object" ? body.project as Record<string, unknown> : {};
     const files = Array.isArray(project.files) ? project.files : [];
     const imports = Array.isArray(project.imports) ? project.imports : [];
-    return `Pythonファイル ${files.length}件・import関係 ${imports.length}件を表示しました。`;
+    return `対応コードファイル ${files.length}件・import関係 ${imports.length}件を表示しました。`;
 }
 
 function annotationsFallbackText(body: BridgeResult): string {
@@ -849,39 +851,7 @@ function launcherFunction(target: string, question: string): string | undefined 
     return undefined;
 }
 
-function launcherViewUrl(body: BridgeResult): string | undefined {
-    const codexView = body.codexView && typeof body.codexView === "object"
-        ? body.codexView as Record<string, unknown>
-        : undefined;
-    return codexView?.type === "browser" && typeof codexView.url === "string" ? codexView.url : undefined;
-}
-
-function requestedStandardLine(body: BridgeResult, functionName: string | undefined): number | undefined {
-    if (!functionName || !body.standard || typeof body.standard !== "object") return undefined;
-    const standard = body.standard as Record<string, unknown>;
-    const items = Array.isArray(standard.items) ? standard.items : [];
-    const requested = functionName.split(".").at(-1)?.trim();
-    if (!requested) return undefined;
-    for (const value of items) {
-        if (!value || typeof value !== "object") continue;
-        const item = value as Record<string, unknown>;
-        if (item.kind === "constant" || typeof item.label !== "string" || typeof item.line !== "number") continue;
-        const label = item.label.replace(/^(?:async\s+)?(?:def|class)\s+/, "").split("(")[0].trim();
-        if (label === requested) return item.line;
-    }
-    return undefined;
-}
-
-async function combineLauncherViews(manifest: BridgeManifest, urls: string[]): Promise<BridgeResult | undefined> {
-    const viewIds = [...new Set(urls.map((url) => launcherViewId(url, manifest)))];
-    if (viewIds.length < 2) return undefined;
-    // AI_NOTE: 表示データをMCPへ再送せず、bridge内で既に検証・保存されたIDだけを一つの画面へ束ねる。
-    return callBridge(manifest, "/combine", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ viewIds }),
-    });
-}
+// AI_NOTE: launcherの生成所有をbridgeへ移したため、MCP内のURL再合成と並列待機は不要。
 
 export function createServer(workspacePath: string, codeCommand?: string, connectTimeoutMs = 20_000): McpServer {
     const options: CliOptions = { workspacePath, codeCommand, connectTimeoutMs };
@@ -891,7 +861,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
     const server = new McpServer(
         { name: SERVER_NAME, version: SERVER_VERSION },
         {
-            instructions: "These tools exist to show code to the person, not to feed code to you. Call them only when the user wants to see, open, navigate, or visualize code, or asks for AI Code Guide by name. When the user's entire request is `$ai-code-guide-request`, or they ask to show, open, or redisplay the AI Code Guide input card, call show_ai_code_guide_launcher immediately and do not substitute an explanation-only response. `$ai-code-guide-request` is the dedicated public skill entry for this input-card feature; AI Code Guide is the product name, so do not treat `/ai-code-guide` as a launcher command. Each call creates a fresh card at the current conversation position. The card posts the entered target, question, and selected views as one normal user message after the host's single send confirmation. When that message requests two or more of standard view, code diagram, execution trace, or inline explanation for one Python file, call dispatch_ai_code_guide_request once so Codex returns one integrated browser view; do not call the individual view tools as well. For one requested view, execute exactly that view without offering candidates, asking a confirmation question, or asking the person to choose again. Never call them to read code for yourself, to check your own edits, to confirm an implementation you just wrote, or to gather context for an answer you will write in text; use ordinary file reading and search for that. When in doubt, do not call them. They also never take over the user's screen: leave focusWindow unset, since only the conversation UI's own code-location button may set it. Once the user does want a view, treat their message as an understanding goal, not a fixed one-tool mapping. Start with the smallest directly requested AI Code Guide view and call no other view unless the user also requested it. The standard view is never a prerequisite or discovery step for trace, diagram, overview, inline, project, explanation, investigation, testing, or implementation requests. Resolve files, functions, classes, and methods for those requests with ordinary file reading or search, then call only the requested view. Use show_standard_view only when the user explicitly asks for the standard view, a definition-order list, or code locations. In Codex it returns a wide browser URL instead of an inline MCP App card; open it immediately when the native browser-panel opener is available and include [標準ビューを開く](<codexView.url>) in the final answer. Use expand_standard_items only when the user wants selected definitions expanded in the current Codex standard view or its mirrored VS Code view. Use overview for file purpose, project for repository shape/imports, diagram for a named behavior, inline for difficult details, and trace for runtime values. Display-only tools are only for an explicit request to show saved, cached, or existing results. A normal request to see or use an execution trace is an explicit request for runtime evidence: use run_trace unless the user specifically asks for saved results only. A normal request to see or use inline explanations is an explicit request to generate them: use generate_inline_annotations unless the user specifically asks for saved results only. If a saved-only display tool was tried for a general trace or inline request and returned no result, continue in the same turn with run_trace or generate_inline_annotations. Never call other create, generate, or run tools unless the user requested the corresponding generated diagram, explanation, or execution evidence; run_trace executes code after a side-effect check. For a requested safety-unknown trace, pass the exact requested function and arguments (including an unknown dynamic target such as mystery); the tool must record the rejection, so never replace them with a known-safe function or value. Do not expand an empty target list into all targets. After show_saved_trace or run_trace succeeds with codexView.url, the same turn's final answer MUST briefly identify the target and include a clickable Markdown link exactly in the form [トレースを開く](<codexView.url>). A VS Code view being shown does not satisfy or replace this browser link. In Codex Desktop, also open codexView.url immediately in the built-in browser panel with the native open-in-Codex capability when available; do not ask the user to copy the URL or start another model turn. Only when codexView.url is absent, say that no browser URL was returned and direct the user to the VS Code AI Code Guide trace view instead. Other hosts may present the resource link directly.",
+            instructions: "These tools exist to show code to the person, not to feed code to you. Call them only when the user wants to see, open, navigate, or visualize code, or asks for AI Code Guide by name. When the user's entire request is `$ai-code-guide-request`, or they ask to show, open, or redisplay the AI Code Guide input card, call show_ai_code_guide_launcher immediately and do not substitute an explanation-only response. `$ai-code-guide-request` is the dedicated public skill entry for this input-card feature; AI Code Guide is the product name, so do not treat `/ai-code-guide` as a launcher command. Each call creates a fresh card at the current conversation position. The card posts the entered target, question, and selected views as one normal user message after the host's single send confirmation. For a launcher request, call dispatch_ai_code_guide_request once so Codex returns one integrated browser view; do not call the individual view tools as well. Standard meaning-range backgrounds and whole-file inline symbol explanations are implicit default layers, while selected code diagrams and execution traces are additions. Never pre-expand Standard purpose, input, output, or block details; those are generated only after the person presses a triangle for one target. Never call these tools to read code for yourself, to check your own edits, to confirm an implementation you just wrote, or to gather context for an answer you will write in text; use ordinary file reading and search for that. When in doubt, do not call them. They also never take over the user's screen: leave focusWindow unset, since only the conversation UI's own code-location button may set it. Outside the launcher workflow, call only the directly requested individual view. The standard view is never a prerequisite or discovery step for trace, diagram, overview, inline, project, explanation, investigation, testing, or implementation requests. Resolve files, functions, classes, and methods for those requests with ordinary file reading or search, then call only the requested view. Use show_standard_view only when the user explicitly asks for the standard view, a definition-order list, or code locations. In Codex it returns a wide browser URL instead of an inline MCP App card; open it immediately when the native browser-panel opener is available and include [標準ビューを開く](<codexView.url>) in the final answer. Use expand_standard_items only when the user wants selected definitions expanded in the current Codex standard view or its mirrored VS Code view. Use overview for file purpose, project for repository shape/imports, diagram for a named behavior, inline for difficult details, and trace for runtime values. Display-only tools are only for an explicit request to show saved, cached, or existing results. A normal request to see or use an execution trace is an explicit request for runtime evidence: use run_trace unless the user specifically asks for saved results only. A normal request to see or use inline explanations is an explicit request to generate them: use generate_inline_annotations unless the user specifically asks for saved results only. If a saved-only display tool was tried for a general trace or inline request and returned no result, continue in the same turn with run_trace or generate_inline_annotations. Never call other create, generate, or run tools unless the user requested the corresponding generated diagram, explanation, or execution evidence; run_trace executes code after a side-effect check. For a requested safety-unknown trace, pass the exact requested function and arguments (including an unknown dynamic target such as mystery); the tool must record the rejection, so never replace them with a known-safe function or value. Do not expand an empty target list into all targets. After show_saved_trace or run_trace succeeds with codexView.url, the same turn's final answer MUST briefly identify the target and include a clickable Markdown link exactly in the form [トレースを開く](<codexView.url>). A VS Code view being shown does not satisfy or replace this browser link. In Codex Desktop, also open codexView.url immediately in the built-in browser panel with the native open-in-Codex capability when available; do not ask the user to copy the URL or start another model turn. Only when codexView.url is absent, say that no browser URL was returned and direct the user to the VS Code AI Code Guide trace view instead. Other hosts may present the resource link directly.",
         },
     );
 
@@ -916,7 +886,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
     for (const [index, uri] of DETAIL_APP_URIS.entries()) {
         server.registerResource(index === 0 ? "detail-view-app" : `detail-view-app-legacy-${index}`, uri, {
             title: "AI Code Guide detail view",
-            description: "Python overview, project structure, inline explanations, and traces rendered inside the conversation.",
+            description: "Code overview, project structure, inline explanations, and Python traces rendered inside the conversation.",
         }, async () => ({
             contents: [{
                 uri,
@@ -933,7 +903,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
         server.registerResource(index === 0 ? "code-evidence-app" : `code-evidence-app-legacy-${index}`, uri, {
             title: "AI Code Guide code evidence",
             description: index === 0
-                ? "Focused Python source with inline explanations or runtime values rendered inside the conversation."
+                ? "Focused source code with inline explanations or Python runtime values rendered inside the conversation."
                 : "Backward-compatible alias for the previous code evidence view.",
         }, async () => ({
             contents: [{
@@ -958,7 +928,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
     }));
 
     const annotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
-    const fileInput = { file: z.string().min(1).describe("Python file path. An absolute path in another project opens that project in VS Code and waits for its AI Code Guide connection.") };
+    const fileInput = { file: z.string().min(1).describe("Python, JavaScript, or TypeScript file path. An absolute path in another project opens that project in VS Code and waits for its AI Code Guide connection.") };
     const activateInput = { activate: z.boolean().optional().describe("Set false to prepare this result without selecting its AI Code Guide tab") };
     const targetLinesInput = z.array(z.number().int().positive()).max(50)
         .describe("Zero, one, or many 1-based lines selected from a previous structured result; an empty list means expand nothing");
@@ -983,7 +953,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
 
     server.registerTool("dispatch_ai_code_guide_request", {
         title: "Run selected AI Code Guide views",
-        description: "Use this when one request asks for two or more AI Code Guide views for the same Python file. Resolve the file, prepare exactly the selected views in parallel, and return one integrated Codex browser view. Standard background colors, execution values, and inline symbol explanations share one code surface; the right sidebar switches between Standard View and Code Diagram and can be hidden.",
+        description: "Resolve one Python file and return one integrated Codex browser view. Standard meaning-range background colors and whole-file inline symbol explanations are always prepared as default layers without expanding Standard details. Prepare any additionally selected Code Diagram or Execution Trace in parallel. Purpose, input, output, and block details remain collapsed until the person presses a Standard View triangle.",
         inputSchema: {
             target: z.string().min(1).max(500),
             question: z.string().min(1).max(2000),
@@ -1000,57 +970,24 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
         const manifest = await loadManifest(options, requestedFile);
         const relative = workspaceFile(requestedFile, manifest, workspacePath);
         const functionName = launcherFunction(target, question);
-        const items = await runUniqueInParallel(views, async (view): Promise<{ view: LauncherView; label: string; status: "completed" | "failed"; url?: string; message?: string }> => {
-            try {
-                if (view === "実行トレース" && !functionName) {
-                    throw new Error("質問か対象に、実行する関数名を example() の形で含めてください。");
-                }
-                let standardBody: BridgeResult | undefined;
-                if (view === "標準ビュー") {
-                    standardBody = await show(manifest, { view: "standard", file: relative, activate: false });
-                    const expandLine = requestedStandardLine(standardBody, functionName);
-                    if (expandLine !== undefined) {
-                        standardBody = await show(manifest, {
-                            view: "standard", file: relative, line: expandLine,
-                            expandLines: [expandLine], activate: false,
-                        });
-                    }
-                }
-                const body = view === "標準ビュー"
-                    ? compactStandardBody(standardBody!)
-                    : view === "コード図"
-                        ? publicDiagramBody(await show(manifest, { view: "diagram", question, file: relative, run: true, activate: false }))
-                        : view === "実行トレース"
-                            ? await show(manifest, { view: "trace", file: relative, run: true, functions: [functionName!], activate: false })
-                            : await show(manifest, { view: "inline", file: relative, run: true, activate: false });
-                return {
-                    view,
-                    label: view,
-                    status: "completed",
-                    ...(launcherViewUrl(body) ? { url: launcherViewUrl(body) } : {}),
-                    message: launcherViewUrl(body) ? "準備できました。" : "VS Code側へ反映しました。",
-                };
-            } catch (error) {
-                return {
-                    view,
-                    label: view,
-                    status: "failed",
-                    message: error instanceof Error ? error.message : String(error),
-                };
-            }
+        // AI_NOTE: 背景と名称辞書は選択式の追加ビューではなく常設レイヤー。標準詳細だけは
+        // ここで先行生成せず、統合画面の三角トグルから対象単位で生成する。
+        const effectiveViews = [...new Set<LauncherView>(["標準ビュー", "インライン解説", ...views])];
+        // AI_NOTE: 長いLLMジョブは拡張bridgeが所有し、MCPはコードsnapshotのURLを直ちに返す。
+        const presentation = await callBridge(manifest, "/prepare", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ file: relative, question,
+                additions: views.flatMap(view => view === "コード図" ? ["diagram"] : view === "実行トレース" ? ["trace"] : []),
+                ...(functionName ? { functions: [functionName] } : {}),
+            }),
         });
-        const completedUrls = items.flatMap((item) => item.status === "completed" && item.url ? [item.url] : []);
-        const combined = await combineLauncherViews(manifest, completedUrls);
-        const singleBody = completedUrls.length === 1
-            ? { view: views[0], codexView: { type: "browser", url: completedUrls[0], view: views[0] } }
-            : undefined;
-        const presentation = combined ?? singleBody ?? {};
+        const items = effectiveViews.map(view => ({ view, label: view, status: "preparing", message: "コードを先に表示し、完成した解説を追加します。" }));
         return success({
             ...presentation,
             dispatch: {
                 target: relative,
                 question,
-                items: items.map(({ url: _url, ...item }) => item),
+                items,
             },
         }, `${items.filter((item) => item.status === "completed").length}/${items.length}件を一つの画面に準備しました。`);
     }));
@@ -1083,11 +1020,12 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
 
     server.registerTool("show_standard_view", {
         title: "Show code locations",
-        description: "Use this when the user wants to read a Python file by function or class, see its definition-order structure, or open the mirrored standard view in VS Code. Do not use it to read a file for yourself. In Codex, it returns a wide browser Webview instead of an inline MCP App card. Open codexView.url in the built-in browser panel when available and include [標準ビューを開く](<codexView.url>) in the final answer. The Webview mirrors the VS Code standard tab with definition-order cards, collapsible class children, and in-card expansions for purpose, input/output or class state/behavior, notes, and semantic reading blocks.",
+        description: "Use this when the user wants to read a Python, JavaScript, or TypeScript file by function or class, see its definition-order structure, or open the mirrored standard view in VS Code. Do not use it to read a file for yourself. In Codex, it returns a wide browser Webview instead of an inline MCP App card. Open codexView.url in the built-in browser panel when available and include [標準ビューを開く](<codexView.url>) in the final answer. The Webview mirrors the VS Code standard tab with definition-order cards, collapsible class children, and in-card expansions for purpose, input/output or class state/behavior, notes, and semantic reading blocks.",
         inputSchema: {
             ...fileInput,
             ...activateInput,
             line: z.number().int().positive().optional().describe("Optional 1-based line to focus"),
+            savedOnly: z.boolean().optional().describe("Only when explicitly requested: read cached backgrounds and inline explanations without starting LLM generation."),
             focusWindow: z.boolean().optional().describe("Reserved for the conversation UI's own code-location button. Never set this; it takes over the user's screen"),
         },
         annotations,
@@ -1095,13 +1033,14 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
             "openai/toolInvocation/invoking": "コード地点を読み込んでいます…",
             "openai/toolInvocation/invoked": "標準ビューを準備しました。",
         },
-    }, guarded(async ({ file, line, activate, focusWindow }: { file: string; line?: number; activate?: boolean; focusWindow?: boolean }) => {
+    }, guarded(async ({ file, line, activate, focusWindow, savedOnly }: { file: string; line?: number; activate?: boolean; focusWindow?: boolean; savedOnly?: boolean }) => {
         const manifest = await loadManifest(options, file);
         const relative = workspaceFile(file, manifest, workspacePath);
         // AI_NOTE: 通常の表示要求は背後のVS Codeを更新するだけにし、会話内図のノードだけが前面化を明示する。
         const body = compactStandardBody(await show(manifest, {
             view: "standard",
             file: relative,
+            backgroundAction: savedOnly ? "read" : "generate",
             ...(line ? { line } : {}),
             ...(activate === false ? { activate: false } : {}),
             ...(focusWindow ? { focusWindow: true } : {}),
@@ -1151,7 +1090,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
 
     server.registerTool("show_file_overview", {
         title: "Show file overview",
-        description: "Use this when the user wants to see a Python file's purpose or semantic groups. It returns and opens saved overview data only; it does not start a new LLM call.",
+        description: "Use this when the user wants to see a supported code file's purpose or semantic groups. It returns and opens saved overview data only; it does not start a new LLM call.",
         inputSchema: { ...fileInput, ...activateInput },
         annotations,
         _meta: { ui: { resourceUri: DETAIL_APP_URI }, "openai/outputTemplate": DETAIL_APP_URI },
@@ -1164,7 +1103,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
 
     server.registerTool("generate_file_overview", {
         title: "Generate file overview",
-        description: "Generate and open a Python file's role and semantic groups with the configured LLM. Use only when the user asks for a newly generated overview and saved data is insufficient.",
+        description: "Generate and open a supported code file's role and semantic groups with the configured LLM. Use only when the user asks for a newly generated overview and saved data is insufficient.",
         inputSchema: { ...fileInput, ...activateInput },
         annotations,
         _meta: { ui: { resourceUri: DETAIL_APP_URI }, "openai/outputTemplate": DETAIL_APP_URI },
@@ -1177,7 +1116,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
 
     server.registerTool("show_project_structure", {
         title: "Show project structure",
-        description: "Use this when the user wants to see the repository's shape or find relevant Python files themselves; do not use it as your own file search. It returns Python files, directories, and import edges and opens the project view without generating new AI descriptions.",
+        description: "Use this when the user wants to see the repository's shape or find relevant Python, JavaScript, and TypeScript files themselves; do not use it as your own file search. It returns supported files, directories, and import edges and opens the project view without generating new AI descriptions.",
         inputSchema: activateInput,
         annotations,
         _meta: { ui: { resourceUri: DETAIL_APP_URI }, "openai/outputTemplate": DETAIL_APP_URI },
@@ -1201,10 +1140,10 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
 
     server.registerTool("create_code_diagram", {
         title: "Create a code diagram",
-        description: "Use when the user asks to visualize or explain the flow, reading order, or dependencies of a named behavior. Always pass an absolute entry Python file so the correct workspace is selected. The result opens only as the same wide HTML Webview used by other AI Code Guide modes, without attaching an MCP App card: nodes navigate the shared code pane, and VS Code receives a mirrored view.",
+        description: "Use when the user asks to visualize or explain the flow, reading order, or dependencies of a named behavior. Always pass an absolute entry Python, JavaScript, or TypeScript file so the correct workspace is selected. The result opens only as the same wide HTML Webview used by other AI Code Guide modes, without attaching an MCP App card: nodes navigate the shared code pane, and VS Code receives a mirrored view.",
         inputSchema: {
             question: z.string().min(1).max(1000).describe("What the user wants to understand about this codebase"),
-            file: z.string().min(1).refine(path.isAbsolute, "Entry file must be an absolute path").describe("Absolute entry Python file; its project opens in VS Code if it is not connected yet"),
+            file: z.string().min(1).refine(path.isAbsolute, "Entry file must be an absolute path").describe("Absolute entry Python, JavaScript, or TypeScript file; its project opens in VS Code if it is not connected yet"),
             ...activateInput,
         },
         annotations,
@@ -1244,7 +1183,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
 
     server.registerTool("generate_inline_annotations", {
         title: "Generate inline explanations",
-        description: "Use the configured LLM to explain important symbols and blocks without attaching a narrow inline MCP App card. A normal request to see or use inline explanations counts as a request to generate them unless the user explicitly asks for saved results only. Omit startLine/endLine for the whole file, or provide both to merge explanations into that contextual range; already-open browser previews for the same file update automatically. On success, open the returned wide Codex browser URL when available and include [解説を開く](<codexView.url>) in the final answer.",
+        description: "Use the configured LLM to build a hover dictionary for variables, functions, methods, and classes without attaching a narrow inline MCP App card. A normal request to see or use inline explanations counts as a request to generate them unless the user explicitly asks for saved results only. Omit startLine/endLine for the whole file, or provide both to merge explanations into that contextual range; already-open browser previews for the same file update automatically. On success, open the returned wide Codex browser URL when available and include [解説を開く](<codexView.url>) in the final answer.",
         inputSchema: {
             ...fileInput,
             ...activateInput,
@@ -1321,6 +1260,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
     }, guarded(async ({ file, line, functions, arguments: callArguments, activate }: { file: string; line?: number; functions?: string[]; arguments?: Record<string, unknown>; activate?: boolean }) => {
         if (line === undefined && functions === undefined) throw new Error("Provide line or functions.");
         if (callArguments !== undefined && functions?.length !== 1) throw new Error("arguments requires exactly one function.");
+        if (languageIdForPath(file) !== "python") throw new Error("Execution traces currently support Python files only.");
         const manifest = await loadManifest(options, file);
         const relative = workspaceFile(file, manifest, workspacePath);
         const body = await show(manifest, {
@@ -1352,6 +1292,7 @@ export function createServer(workspacePath: string, codeCommand?: string, connec
             throw new Error(`An arguments-only retry without file requires exactly one open trace entry; found ${soleOpenEntry.length}.`);
         }
         const requestedFile = file ?? soleOpenEntry[0].absoluteFile;
+        if (languageIdForPath(requestedFile) !== "python") throw new Error("Execution traces currently support Python files only.");
         const manifest = await loadManifest(options, requestedFile);
         const relative = workspaceFile(requestedFile, manifest, workspacePath);
         const entryKey = `${path.resolve(manifest.workspaceRoot).toLowerCase()}::${relative.toLowerCase()}`;

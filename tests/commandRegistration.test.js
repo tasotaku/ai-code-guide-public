@@ -39,6 +39,15 @@ assert.ok(extensionSource.includes('const traceValueFormat = "readable-values-v4
 assert.ok(!savedTrace.includes("traceOne("), "保存済み表示からLLM生成・Python実行へフォールバックしてはいけません");
 assert.ok(savedTrace.includes("args?.funcs !== undefined"), "空の複数対象を全関数へ暗黙変換してはいけません");
 
+const traceFunctionsStart = extensionSource.indexOf('registerCommand("aiCodeGuide.traceFunctions"');
+const traceFunctionsEnd = extensionSource.indexOf('registerCommand("aiCodeGuide.showSavedTraces"', traceFunctionsStart);
+const traceFunctions = extensionSource.slice(traceFunctionsStart, traceFunctionsEnd);
+const traceFunctionStart = extensionSource.indexOf('registerCommand("aiCodeGuide.traceFunction"');
+const traceFunctionEnd = extensionSource.indexOf('registerCommand("aiCodeGuide.clearTrace"', traceFunctionStart);
+const traceFunction = extensionSource.slice(traceFunctionStart, traceFunctionEnd);
+assert.ok(traceFunctions.includes('document.languageId !== "python"'), "複数実行トレースはPython専用境界を維持する必要があります");
+assert.ok(traceFunction.includes('editor.document.languageId !== "python"'), "単一実行トレースはPython専用境界を維持する必要があります");
+
 const inlineCommandStart = extensionSource.indexOf('registerCommand("aiCodeGuide.explainBlockInline"');
 const inlineCommandEnd = extensionSource.indexOf('registerCommand("aiCodeGuide.regenerateBlockInline"', inlineCommandStart);
 const inlineCommand = extensionSource.slice(inlineCommandStart, inlineCommandEnd);

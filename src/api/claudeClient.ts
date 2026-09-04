@@ -1,10 +1,12 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { SemanticAnnotation, RawAnnotation, buildSymbolAnnotation, dedupAnnotations, resolveAnnotations } from "./annotationResolver";
+import { SemanticAnnotation, RawAnnotation, buildSymbolAnnotation, dedupAnnotations } from "./annotationResolver";
 import type { SymbolOccurrence } from "../flowchart/astParser";
-import { createMessage, hasKeyForModel, LlmEffort } from "./llmProvider";
+import { createMessage, effectiveModel, hasKeyForModel, LlmEffort, providerOf } from "./llmProvider";
+import type { MeaningBlock, BackgroundIdentity } from "./semanticBackground";
 import { missingRequestedProjectDiagramSymbols, projectDiagramConnectivity } from "./projectDiagramValidation";
+import { buildSymbolDictionaryCacheIdentity, buildSymbolGenerationBatches, buildSymbolGenerationEvidence, planSymbolDescriptionReuse } from "./symbolDictionaryCache";
 
 // AI_NOTE: SemanticAnnotation の定義は annotationResolver に移した（vscode非依存にして単体テスト可能にするため）。
 // 既存の import 元（blockExplanationProvider 等）を壊さないようここで再エクスポートする。
@@ -37,165 +39,6 @@ function getChatModel(): string {
 function getChatEffort(): LlmEffort {
     const v = vscode.workspace.getConfiguration("aiCodeGuide").get<string>("chatEffort", "low");
     return v === "medium" || v === "high" ? v : "low";
-}
-
-// AI_NOTE: 密度は件数ではなく「どこまで自明寄りの知識も補うか」の選定基準にする。
-// project固有シンボル等の必須対象は全密度共通で、maxはJSON切り詰め防止だけに使う。
-function getAnnotationCriteria(): { density: string; criteria: string; max: number } {
-    const density = vscode.workspace
-        .getConfiguration("aiCodeGuide")
-        .get<string>("inlineAnnotationDensity", "normal");
-    if (density === "minimal") return {
-        density,
-        criteria: "必須対象と、理解を止める重大な非自明箇所・高確信warningだけを説明する",
-        max: 4096,
-    };
-    if (density === "normal") return {
-        density,
-        criteria: "必須対象に加え、役割を忘れやすい変数、馴染みの薄いPython/API、意味のある制御ブロックを説明する",
-        max: 8192,
-    };
-    if (density === "dense") return {
-        density,
-        criteria: "標準の対象に加え、中間変数、比較的よく使うAPI、二次的な設計判断まで積極的に説明する",
-        max: 12288,
-    };
-    return {
-        density,
-        criteria: "完全な構文ノイズ以外は、初学者が調べず読めるよう細部まで網羅して説明する",
-        max: 16384,
-    };
-}
-
-export type RequiredAnnotationKind = "import" | "constructor" | "assert" | "with";
-export interface RequiredAnnotationTarget {
-    kind: RequiredAnnotationKind;
-    line: number;
-    token?: string;
-    description: string;
-}
-
-// AI_NOTE: 利用者が1回「生成」した時に欠けてはいけない理解対象。件数を固定するのではなく、
-// コード中に実在するproject/API境界を列挙し、生成後に実座標でカバレッジを検証する。
-export function requiredAnnotationTargets(code: string): RequiredAnnotationTarget[] {
-    const lines = code.replace(/\r\n/g, "\n").split("\n");
-    const targets: RequiredAnnotationTarget[] = [];
-    const seenAssertions = new Set<string>();
-
-    const importedNames = (spec: string): string[] => spec
-        .replace(/[()]/g, "")
-        .split(",")
-        .map((part) => part.trim().match(/^([A-Za-z_]\w*)(?:\s+as\s+[A-Za-z_]\w*)?$/)?.[1] ?? "")
-        .filter(Boolean);
-
-    for (let line = 0; line < lines.length; line++) {
-        const source = lines[line];
-        const fromImport = source.match(/^\s*from\s+\S+\s+import\s+(.+?)(?:\s+#.*)?$/);
-        const plainImport = source.match(/^\s*import\s+(.+?)(?:\s+#.*)?$/);
-        const names = fromImport
-            ? importedNames(fromImport[1])
-            : plainImport
-                ? plainImport[1].split(",").map((part) => part.trim().split(/\s+as\s+/)[0].split(".")[0]).filter(Boolean)
-                : [];
-        for (const token of names) {
-            targets.push({ kind: "import", line, token, description: `${token}がこのコードで担う役割` });
-        }
-
-        const constructor = source.match(/^\s*([A-Za-z_]\w*)\s*=\s*([A-Z]\w*)\s*\(/);
-        if (constructor) {
-            targets.push({
-                kind: "constructor", line, token: constructor[1],
-                description: `${constructor[1]}が保持する役割と${constructor[2]}の意味`,
-            });
-        }
-
-        const assertion = source.match(/\bself\.(assert[A-Z]\w*)\s*\(/);
-        if (assertion && !seenAssertions.has(assertion[1])) {
-            seenAssertions.add(assertion[1]);
-            targets.push({
-                kind: "assert", line, token: assertion[1],
-                description: `${assertion[1]}が検証する条件と失敗時の意味`,
-            });
-        }
-        if (/^\s*with\b.+:\s*$/.test(source)) {
-            targets.push({ kind: "with", line, description: "withが管理する範囲と終了時の挙動" });
-        }
-    }
-    return targets;
-}
-
-function targetCovered(target: RequiredAnnotationTarget, annotation: SemanticAnnotation, codeLines: string[]): boolean {
-    if (target.kind === "with") return annotation.kind === "block" && annotation.startLine === target.line;
-    if (target.kind === "assert") {
-        if (annotation.kind === "block" && annotation.startLine === target.line) return true;
-        return annotation.kind === "symbol" && annotation.startLine === target.line
-            && !!target.token && annotation.anchorToken?.includes(target.token) === true;
-    }
-    if (target.kind === "constructor") {
-        return annotation.kind === "symbol" && annotation.startLine === target.line;
-    }
-    if (annotation.kind !== "symbol" || annotation.startLine !== target.line || !target.token) return false;
-    const source = codeLines[target.line] ?? "";
-    const tokenStart = source.indexOf(target.token);
-    return tokenStart >= 0 && annotation.startCol !== null && annotation.endCol !== null
-        && annotation.startCol <= tokenStart && annotation.endCol >= tokenStart + target.token.length;
-}
-
-export function missingRequiredAnnotationTargets(
-    code: string,
-    annotations: SemanticAnnotation[],
-): RequiredAnnotationTarget[] {
-    const lines = code.replace(/\r\n/g, "\n").split("\n");
-    return requiredAnnotationTargets(code).filter((target) =>
-        !annotations.some((annotation) => targetCovered(target, annotation, lines)));
-}
-
-// AI_NOTE: モデルがファイル全体の流れだけを優先して識別子説明を落とさないよう、
-// import・生成オブジェクト・assertXxx・with・生成済みオブジェクトのmethod呼出を候補として明示する。
-export function annotationTargetHints(code: string): string[] {
-    const lines = code.replace(/\r\n/g, "\n").split("\n");
-    const constructed = new Set<string>();
-    const seenAssertions = new Set<string>();
-    const seenMethods = new Set<string>();
-    const reasons = new Map<number, Set<string>>();
-    const add = (line: number, reason: string) => {
-        const lineReasons = reasons.get(line) ?? new Set<string>();
-        lineReasons.add(reason);
-        reasons.set(line, lineReasons);
-    };
-
-    for (let line = 0; line < lines.length; line++) {
-        const source = lines[line];
-        if (/^\s*(?:from\s+\S+\s+import\s+.+|import\s+.+)$/.test(source)) add(line, "importした名前の役割");
-
-        const constructor = source.match(/^\s*([A-Za-z_]\w*)\s*=\s*([A-Z]\w*)\s*\(/);
-        if (constructor) {
-            constructed.add(constructor[1]);
-            add(line, `${constructor[1]}が保持する役割と${constructor[2]}の意味`);
-        }
-
-        const assertion = source.match(/\bself\.(assert[A-Z]\w*)\s*\(/);
-        if (assertion && !seenAssertions.has(assertion[1])) {
-            seenAssertions.add(assertion[1]);
-            add(line, `${assertion[1]}が検証する条件と失敗時の意味`);
-        }
-        if (/^\s*with\b.+:\s*$/.test(source)) add(line, "withが管理する範囲と終了時の挙動");
-    }
-
-    for (let line = 0; line < lines.length; line++) {
-        for (const variable of constructed) {
-            const method = new RegExp(`\\b${variable}\\.([A-Za-z_]\\w*)\\s*\\(`);
-            const match = lines[line].match(method);
-            const key = match ? `${variable}.${match[1]}` : "";
-            if (key && !seenMethods.has(key)) {
-                seenMethods.add(key);
-                add(line, `${key}のproject固有methodの役割`);
-            }
-        }
-    }
-    return [...reasons.entries()]
-        .sort(([left], [right]) => left - right)
-        .map(([line, values]) => `${line}|${lines[line]} [${[...values].join(" / ")}]`);
 }
 
 // AI_NOTE: 早期returnガード用。引数モデルを呼ぶプロバイダのキーが設定済みかを判定する(llmProviderへ委譲)。
@@ -589,7 +432,7 @@ export async function generateNodeLabels(
     const globalCtx = getGlobalContext();
 
     const systemPrompt = [
-        "Pythonフローチャートの各ノードの文言(コード断片)を、コードを読めない人でも処理の流れが追える短い日本語に言い換えてください。",
+        "コードのフローチャートにある各ノードの文言(コード断片)を、コードを読めない人でも処理の流れが追える短い日本語に言い換えてください。",
         "ルール:",
         "- 逐語訳でなく意味を言い換える。変数名・関数名はどうしても必要な時だけ残す。",
         "- (condition): 「〜か?」の疑問形。例: 'リストが空か?', '残高が足りるか?'",
@@ -643,7 +486,7 @@ export async function generateBlockDescriptions(
         .join("\n\n---\n\n");
 
     const systemPrompt = [
-        "Pythonコードの各ノードに対して日本語の1行説明を生成してください。",
+        "コードの各ノードに対して日本語の1行説明を生成してください。",
         "ノード種別ごとのルール:",
         "- (function): この関数の役割を「〇〇関数」の形で一言で表現する。コードの実装方法ではなく関数の名前・役割を答える。",
         "  例: 'クイックソート関数', 'ユーザー認証チェック', 'ナップサック問題DP解法'",
@@ -691,7 +534,7 @@ export async function generateDirDescriptions(
         .join("\n\n");
 
     const systemPrompt = [
-        "Pythonプロジェクトの各ディレクトリの役割を日本語で説明してください。",
+        "コードプロジェクトの各ディレクトリの役割を日本語で説明してください。",
         "各ディレクトリについて20文字以内の1行説明を返してください。",
         '回答はJSONのみ: {"dirName": "説明", ...}',
         globalCtx ? `文脈: ${globalCtx}` : "",
@@ -731,7 +574,7 @@ export async function generateFileDescriptions(
         .join("\n\n");
 
     const systemPrompt = [
-        "Pythonファイルの役割を日本語で説明してください。",
+        "コードファイルの役割を日本語で説明してください。",
         "各ファイルについて30文字以内の1行説明を返してください。",
         "ファイル名と関数名から「このファイルが何をするか・どんな責務を持つか」を端的に表現する。",
         "例: 「ユーザー認証・ログイン処理」「商品・在庫データモデル定義」「APIエンドポイント（認証系）」",
@@ -815,7 +658,7 @@ export async function generateProjectDiagram(
         `- ${f.path}\n  imports in this project: ${f.imports.join(", ") || "(none)"}\n  symbols: ${f.symbols.join(", ") || "(module level)"}\n  definition anchors: ${f.anchors.join(" | ") || "(module level)"}\n  source excerpt:\n${f.source || "(empty file)"}`
     ).join("\n");
     const systemPrompt = [
-        "Pythonプロジェクトについて、利用者の質問に直接答える単純な図を設計してください。",
+        "コードプロジェクトについて、利用者の質問に直接答える単純な図を設計してください。",
         `質問に必要なコード地点だけを3〜${requestedLimit}個選び、関係を矢印で結んでください。質問で実在symbol（関数・class・method）が明示された場合は${requestedLimit}個の上限内ですべて含めてください。`,
         "kindは必ず次の3種類から選んでください: 実際の処理順・呼び出し順はflow、推奨するコードの読解順はreading、機能や処理の依存関係はdependency。",
         "flowのedgeは実際に実行される方向、readingのedgeは読む順番、dependencyのedgeは対象から依存先への方向にしてください。",
@@ -948,7 +791,7 @@ export async function generateFileOverview(
     const structure = nodes.map((n) => `- ${n.kind}: ${n.label}`).join("\n") || "(要素なし)";
 
     const systemPrompt = [
-        "Pythonファイル全体の性格を1つの型に分類してください。",
+        "コードファイル全体の性格を1つの型に分類してください。",
         "判断材料はファイル名とトップレベル要素(種類+ラベル)の一覧です。",
         "次の型から最もよく当てはまる1つを選ぶ:",
         "- definitions: クラス・関数の定義が並ぶ(部品ライブラリ)",
@@ -1006,7 +849,7 @@ export async function generateModuleGroups(
         .join("\n");
 
     const systemPrompt = [
-        "以下はPythonファイルのトップレベル要素（関数・クラス・名前付き定数）一覧です（コード上の行順に並んでいます）。",
+        "以下はコードファイルのトップレベル要素（関数・クラス・名前付き定数）一覧です（コード上の行順に並んでいます）。",
         "コード上で連続して並んでいる要素をまとめて、意味的なグループを作ってください。",
         "ルール:",
         "  - コード上で連続している要素だけを同じグループにまとめること（順序を入れ替えたり飛び越えてまとめたりしない）",
@@ -1087,6 +930,76 @@ export interface BlockExpansion {
     blocks: SubBlock[];
 }
 
+export function getSemanticBackgroundIdentity(): BackgroundIdentity {
+    // AI_NOTE: 保存キーには設定名でなく実際のルーティング先と、生成に渡す文脈を含める。
+    const model = effectiveModel(getModel());
+    return { model, provider: providerOf(model), globalContext: getGlobalContext(), schema: "meaning-background/1" };
+}
+
+export async function generateMeaningBackground(
+    name: string, lines: string[], kind: string, identity = getSemanticBackgroundIdentity(),
+): Promise<MeaningBlock[]> {
+    // AI_NOTE: 背景はLLMの意味区分だけを生成する。空出力・設定変更・認証不足をASTの色分けで隠さない。
+    if (JSON.stringify(identity) !== JSON.stringify(getSemanticBackgroundIdentity())) throw new Error("背景の生成設定が変更されました。更新してください。");
+    if (!hasApiKey(identity.model)) throw new Error("背景生成に必要な認証がありません。");
+    const message = await createMessage({
+        model: identity.model,
+        max_tokens: 4096,
+        system: [
+            "Pythonコードを、意味のある処理のまとまりに分けてください。背景色に使う区切りと短い役割ラベルだけを作ります。",
+            "目的・入出力・詳細説明は生成しないでください。各文を機械的に別区分にせず、役割が変わる地点を境界にします。",
+            "準備、主要な変換・反復、結果の返却など、意味の違いを判断してください。まとまりが一つなら1区分で構いません。",
+            "行0から最終行まで、連続して隙間・重複なくカバーしてください。複数行文の途中では切らないでください。",
+            "子定義の本体は別対象として省略されていることがあります。子の宣言は一つのまとまりとして扱ってください。",
+            "空行やコメントは区切りの参考であり、意味のまとまりを優先します。labelは15文字以内の日本語。",
+            'JSONのみ: {"blocks":[{"lineStart":0,"lineEnd":3,"label":"役割"}]}。行番号は提示コード内の0始まりです。',
+            identity.globalContext ? `読者の文脈: ${identity.globalContext}` : "",
+        ].filter(Boolean).join("\n"),
+        messages: [{ role: "user", content: `${kind}: ${name}\n${lines.map((line, i) => `${i}: ${line}`).join("\n")}` }],
+    });
+    trackUsage(message.usage, "generateMeaningBackground", message.model);
+    const text = message.content.find(item => item.type === "text");
+    const parsed = JSON.parse(extractJsonStr(text?.type === "text" ? text.text : "{}"));
+    if (!Array.isArray(parsed.blocks) || !parsed.blocks.length) throw new Error("背景の意味区分が返されませんでした。");
+    return parsed.blocks;
+}
+
+export async function generateMeaningDetails(
+    name: string, lines: string[], kind: string, blocks: MeaningBlock[], identity = getSemanticBackgroundIdentity(),
+): Promise<BlockExpansion> {
+    // AI_NOTE: 詳細LLMには区切りを変更する権限を渡さず、区分IDに対する説明だけを受け取る。
+    if (JSON.stringify(identity) !== JSON.stringify(getSemanticBackgroundIdentity())) throw new Error("詳細の生成設定が変更されました。更新してください。");
+    if (!hasApiKey(identity.model)) throw new Error("詳細生成に必要な認証がありません。");
+    const message = await createMessage({
+        model: identity.model,
+        max_tokens: 8192,
+        system: [
+            "Pythonコードの詳細を日本語で説明してください。保存済みの意味区分とラベルは変更しないでください。",
+            "overviewには目的purpose、入力input、出力outputを各1〜2文。クラスなら状態stateと提供機能behaviorも含めます。",
+            "blocksには指定された各idのdescriptionを1〜2文で返します。区分の増減・結合・分割は禁止です。",
+            'JSONのみ: {"overview":{"purpose":"...","input":"...","output":"..."},"blocks":[{"id":0,"description":"..."}]}',
+            identity.globalContext ? `読者の文脈: ${identity.globalContext}` : "",
+        ].filter(Boolean).join("\n"),
+        messages: [{ role: "user", content: `${kind}: ${name}\n区分: ${JSON.stringify(blocks.map((b, id) => ({ id, ...b })))}\nコード:\n${lines.map((line, i) => `${i}: ${line}`).join("\n")}` }],
+    });
+    trackUsage(message.usage, "generateMeaningDetails", message.model);
+    const text = message.content.find(item => item.type === "text");
+    const parsed = JSON.parse(extractJsonStr(text?.type === "text" ? text.text : "{}"));
+    if (!parsed.overview || typeof parsed.overview.purpose !== "string" || !parsed.overview.purpose.trim()
+        || !Array.isArray(parsed.blocks) || parsed.blocks.length !== blocks.length) throw new Error("詳細の出力形式が不正です。");
+    const descriptions = new Map<number, string>();
+    for (const item of parsed.blocks) {
+        if (!Number.isInteger(item.id) || item.id < 0 || item.id >= blocks.length || descriptions.has(item.id)
+            || typeof item.description !== "string" || !item.description.trim()) throw new Error("詳細の区分IDが一致しません。");
+        descriptions.set(item.id, item.description);
+    }
+    const overview: BlockOverview = { purpose: parsed.overview.purpose, input: "", output: "" };
+    for (const key of ["input", "output", "state", "behavior", "note"] as const) {
+        if (typeof parsed.overview[key] === "string") overview[key] = parsed.overview[key];
+    }
+    return { overview, blocks: blocks.map((block, id) => ({ ...block, description: descriptions.get(id)! })) };
+}
+
 export async function generateBlockBreakdown(
     blockName: string,
     blockLines: string[],
@@ -1126,7 +1039,7 @@ export async function generateBlockBreakdown(
         ? '{"overview":{"purpose":"...","state":"...","behavior":"...","note":"..."},"blocks":[{"label":"...","lineStart":0,"lineEnd":3,"description":"..."}, ...]}'
         : '{"overview":{"purpose":"...","input":"...","output":"...","note":"..."},"blocks":[{"label":"...","lineStart":0,"lineEnd":3,"description":"..."}, ...]}';
     const systemPrompt = [
-        "Pythonコードのブロックについて、概要(overview)と意味のある処理単位への分解(blocks)を行ってください。",
+        "コードのブロックについて、概要(overview)と意味のある処理単位への分解(blocks)を行ってください。",
         ...(blockKind === "class" ? classOverviewRules : callableOverviewRules),
         "blocksのルール:",
         "  - 関数・メソッドは、定義を含めて6行以上なら必ず2〜6個の単位に分ける。代入準備、loop、条件分岐、例外処理、returnなど役割が変わる地点を境界にする",
@@ -1231,225 +1144,6 @@ Reply ONLY with JSON: {"granularity": "coarse"|"normal"|"detail", "targetFunc": 
     }
 }
 
-// AI_NOTE: 意味的なコード解説の単位。symbol=行内の特定トークン、block=複数行まとまり
-// startCol/endCol は symbol のときのみ設定。block のときは null（行全体を指す）
-// AI_NOTE: LLMにコードの意味的な区分けを判断させてアノテーションを返す。
-// 設計変更: モデルには行・列番号ではなく「注釈する実テキスト」を返させ、位置の特定は
-// resolveAnnotations（決定的な文字列探索）に任せる。モデルの数え間違いに依存しない。
-// パース失敗は [] を返してサイレントに処理（API境界の最小例外処理）
-export async function generateSemanticAnnotations(code: string): Promise<SemanticAnnotation[]> {
-    const { criteria, max: maxTokens } = getAnnotationCriteria();
-    if (!hasApiKey(getInlineAnnotationModel())) return [];
-
-    const globalCtx = getGlobalContext();
-
-    // AI_NOTE: 各行頭に「N|」で行番号を埋め込む。モデルは数えず見える番号をそのまま書くだけにする。
-    const sourceLines = code.replace(/\r\n/g, "\n").split("\n");
-    const numbered = sourceLines.map((l, i) => `${i}|${l}`).join("\n");
-
-    // AI_NOTE: 出力契約を「テキストを丸コピー」中心に変更。
-    // 番号はヒント、lineText/token/startLineText/endLineText が位置の正（resolver が探索して確定）。
-    // AI_NOTE: warning は赤表示になるため、正常なアルゴリズム説明ではなく「問題点・発生条件・影響」が言える時だけ許可する。
-    const systemPrompt = [
-        "あなたは熟練エンジニアで、AIが生成したPythonコードの読解を補助します。",
-        "読者は標準的な開発者です。コード理解には2段階あります: step1=流れの把握（これは何か・このまとまりが何をするか）、step2=設計判断の理解（なぜこう書いたか）。",
-        `選定基準: ${criteria}。件数を先に決めず、この基準に該当する対象を過不足なく選んでください。`,
-        "各箇所に2つ書きます: label（ホバー不要で常時表示する=step1）と explanation（ホバーで出す=step2）。",
-        "step2 が浅い箇所でも、step1 として役立つなら選んでよい（explanation は短くてよい）。",
-        "",
-        "## symbol と block の使い分け（バランス重視・重要）",
-        "- block（複数行）= 意味のあるまとまり。ループ本体・条件分岐・アルゴリズムの一段階・初期化セット・try/except などは block で「全体が何をするか」を説明する",
-        "- symbol（行内トークン）= その1箇所だけが非自明なとき。特定のメソッド呼び出し・式・変数の意味に限定",
-        "- 変数・引数・属性は「その値が何を表すか（役割・単位・概念）」が名前や型だけから即座に分からないなら step1 として symbol で拾う（例: capacity=「キャッシュが保持できる最大件数」、ttl_seconds=「各項目の有効秒数」、self._expiry=「キーごとの失効時刻」）。ただしループ変数 i や自明な一時変数は拾わない",
-        "- 変数は直前の単純な代入だけで意味が完全に分かる場合を除き、後で『何用だったか』を思い出す必要があるなら拾う。生成オブジェクトを保持する変数は、変数の役割と生成クラスの役割を一緒に説明する",
-        "- project内で定義されたimport対象・クラス・関数・メソッドは読者が知っていると仮定しない。import文と最初の意味ある利用箇所を必ず拾い、このprojectでの役割を説明する",
-        "- `from x import A, B, C` はA/B/Cをまとめて1件にせず、各import名をtokenにした独立symbolを必ず返す。それぞれが何を表す型・例外・サービスか説明する",
-        "- `name = ProjectClass(...)` はnameをtokenにしたsymbolを必ず返し、その変数が後続処理で何を保持するかとProjectClassの役割を一緒に説明する",
-        "- Python組み込み・標準ライブラリ・外部ライブラリも、len/print/range等の非常に一般的なもの以外は拾う。迷ったら説明する側に倒す",
-        "- unittestのassertRaises/assertEqual/assertIs等のassertXxxは、各種類の最初の利用箇所を拾い、何を検証し失敗時にどうなるかを説明する",
-        "- with文は必ずblockで拾い、context managerが管理する範囲、終了時の処理、asで受け取る値をこのコードに即して説明する",
-        "- `with self.assertRaises(...)` は1つのblockでwithとassertRaisesの両方を説明する。重複するsymbolは付けない",
-        "- 偏りを避ける: symbol ばかりにしない。複数行で1つの処理を成すものは積極的に block にする。目安として解説の3〜5割は block にできるはず",
-        "- 1行で完結する処理を無理に block にしない。逆に、数行にまたがる処理を symbol で部分的に指すより block でまとめる方がよい",
-        "- block が if/for/while/try/with/match を含む場合、block は必ずその制御文ヘッダ行から始める。制御文より前の代入・検査を同じblockへ巻き込まない",
-        "- 制御文直前に、別々の入力を検査・変換する call 代入が複数並ぶ場合、それぞれのcallを独立したsymbolにする。2入力の検査を1件へまとめない",
-        "- blockの範囲は同じ制御構造と、その結果を確定する直後のreturnまでに限定する。前処理と後続の別処理を大きなblockへ一括しない",
-        "- 1つの意味段階には原則1件だけ付ける。同じ段階をblockと、その内部の代入・演算・callのsymbolへ細分化して重複説明しない",
-        "- ループのblockはfor/whileヘッダから、そのループにインデントされた最後のbody行まで。ループ後の関数returnや次の文を含めない",
-        "- 連続する直線的な計算・変換・集約が1つの結果を組み立てる場合、各代入をsymbolへ分割せず、最初の計算から結果returnまでを1つのblockとして説明する",
-        "- 空list・0・False等の初期化でも、属性や変数が何を記録する入れ物かが名前だけで明白でなければ拾う。役割が即座に分かる一時変数だけを省く",
-        "- 関数名とdocstringが役割を明示し、本体も単純なif→raise→returnだけの短いguard helperは選ばない。呼び出し側でそのguardを使う非自明な地点を優先する",
-        "- module末尾のSAMPLE/EXAMPLE/DEMO用途の単純なliteral定数・引数辞書は原則省く。ただしproject固有クラス・メソッドの使い方を示す箇所は必須対象として拾う",
-        "- 非自明な関数内で、入力の検査・変換に続くifが例外を送出し、その後に正常returnがある場合、そのifから正常returnまでを1つのblockとして必ず優先する",
-        "- JSONを書く前に候補を意味段階で整理する。必須の識別子説明 → 危険操作warning → 例外制御 → 分岐/loop → 複数段の計算・集約 → 入力検査symbol の順で確認する",
-        "- 最終自己検査: 同じ関数の連続計算が複数symbolや部分blockに分かれていたら、最初の計算から結果returnまでの1blockへ統合してからJSONを返す",
-        "",
-        "## 同じ行に複数付けてよい（条件あり）",
-        "- 1行に独立した注目点が複数あれば、それぞれ別の symbol として付けてよい（例: メソッド呼び出しと変数を別々に解説）",
-        "- ただし範囲が重なる・入れ子になるトークンは選ばない（例: `arr[1:]` と それを含む `[x for x in arr[1:] ...]` の両方はダメ。どちらか一方）",
-        "- 1行に詰め込みすぎない。本当に別個に説明する価値があるものだけ",
-        "",
-        "## label（step1）と explanation（step2）の書き分け（最重要）",
-        "- label = step1（常時表示・流れ）: 「これが何か・このまとまりが何をするか」を、その関数/メソッド/ループを初見の人が一読で掴める粒度で書く。調べる手間を省くのが仕事。",
-        "  - symbol の label: 20〜30文字。「このトークン/メソッドが何か」（例: 「先頭をO(1)で取り出す両端キュー」「pivotを除いた残りの要素」）",
-        "  - block の label: 40〜50文字。「この複数行が全体で何をするか」を流れが追える粒度で要約（縦に長い欄に流すので短すぎると間延びする）",
-        "  - label では「メソッドの役割を名指す」「ループを要約する」をむしろ積極的にやる（下の step2 禁止事項は label には適用しない）",
-        "  - 不可: 話題だけのタグ（「DP遷移の核心」等）。何をするかを言い切る",
-        "- explanation = step2（ホバーで出す本文）: 読者が下線に触れて初めて読む唯一の文なので、**単体で読んで完結する**こと。",
-        "  - symbol の explanation: 60〜120文字。1文目で「これが何か」を言い切り、2文目以降で「なぜこう書くか・非自明な点」を足す。label を読んでいない前提で書く（labelは別の場所に出る短い見出しで、ホバー本文には出ない）",
-        "  - block の explanation: 30〜60文字。block は label が枠の右に常時見えているので、その一段深い理解だけを足す（label の言い換えにしない）",
-        "",
-        "## explanation（step2）の中身",
-        "explanation の「なぜ」の部分は次のどれかを答えること:",
-        "- 非自明な振る舞い: 計算量・落とし穴・境界条件・なぜこの書き方を選ぶか（例: list.pop(0)はO(n)だがdequeなら両端O(1)）",
-        "- 設計判断: なぜこのデータ構造/書き方を選び、他の選択肢を捨てたか",
-        "- データの意味: 配列やフラグが表す概念（例: dp[i][w]=i個目まで・容量wでの最大価値）",
-        "",
-        "## explanation（step2）でやってはいけない（貧弱な step2 の典型）",
-        "- 構文名の言い換えで終わる: 「内包表記でフィルタ」「両端キュー」「nonlocalキーワード」← 何かを言っただけで、なぜに踏み込んでいない",
-        "- コードの逐語訳: 「arr[1:]で2番目以降を取得」「iに1を足す」← 読めばわかる",
-        "- symbol で「これが何か」だけで終える／block で label と同内容を繰り返す",
-        "- 選定の禁止: docstring/コメントの言い換え、`return x`/`pass`等の自明行は そもそも選ばない",
-        "- ただし「変数/引数/属性が何を表すか」が非自明なら自明行ではない。値の意味づけ(step1)は構文が単純でも積極的に拾う（例: `self.capacity = capacity` の capacity）",
-        "- `__main__`/デモ実行部も対象にしてよい: 「このクラスをどう使うか・各ステップが何を示すか」を step1 で説明する（例: 「容量3に対し4件目を入れて最古が消えることを示す」）。ただし既存コメントの逐語言い換えはしない",
-        "",
-        "## バグ・問題の指摘（severity:\"warning\"、任意）",
-        "- warning は赤枠で表示される。読者が一目で「何が危ないのか」分かる内容に限る",
-        "- 明らかなバグ・論理矛盾・セキュリティ上危険な実装に限り severity を \"warning\" にして指摘してよい",
-        "- 高確信のものだけ。少しでも推測が混じるなら出さない（誤検知は信頼を致命的に損なう）",
-        "- warning にするには「問題点」「発生条件」「悪い結果」を具体的に説明できること。どれか1つでも曖昧なら info にする",
-        "- 正常なアルゴリズムの性質・実装意図・計算量上の工夫・一般的な注意点は warning にしない。重要でも info にする",
-        "- warning の label は必ず「問題: 」で始め、何が壊れる/危険かを書く（例: 「問題: 空入力でIndexErrorになる」）",
-        "- warning の explanation も単体で完結させる。「問題: ...。条件: ...。影響: ...。」の形で、何が問題か・発生条件・悪い結果の3つを書く（labelを読んでいない前提）",
-        "- ファイル書込み・ネットワーク・subprocess・動的dispatchなど、実行すると外部状態を変えるか安全性を証明できない操作の warning は、explanation の末尾に必ず『この操作は実行しない。』と明記する。単なる例外や純粋計算のwarningには付けない",
-        "- 通常の解説は severity を \"info\"（省略可。未指定は info 扱い）",
-        "",
-        "## label（step1）/ explanation（step2）の対比",
-        "- `deque`（symbol）",
-        "  label: 「先頭をO(1)で取り出せる両端キュー」（これが何か・常時表示の短い見出し）",
-        "  explanation: 「両端への追加と取り出しがO(1)でできるキュー。listのpop(0)は要素を全部ずらすのでO(n)かかるが、BFSは先頭取り出しを繰り返すのでここが効いてくる」（単体で完結: 何か→なぜ）",
-        "- `[x for x in arr[1:] if x <= pivot]`（symbol）",
-        "  label: 「pivot未満の要素を集めて左の部分配列にする」（何をするか）",
-        "  explanation: 「pivot以下の要素だけを集めて左半分を作る式。pivotをarr[0]に固定したので走査対象をarr[1:]にしており、これでpivot自身が両側に二重計上されるのを防いでいる」（単体で完結）",
-        "- warning は別物: 正常な性質（「FIFOで最短候補から処理する」等）は info。「何が壊れるか」言える時だけ warning にする。",
-        "",
-        "## 入力形式",
-        "各行は「N|コード」の形式。N は0始まりの行番号。",
-        "",
-        "## few-shot 例",
-        "入力:",
-        "0|def quicksort(arr: list[int]) -> list[int]:",
-        "1|    if len(arr) <= 1:",
-        "2|        return arr",
-        "3|    pivot = arr[0]",
-        "4|    less = [x for x in arr[1:] if x <= pivot]",
-        "5|    greater = [x for x in arr[1:] if x > pivot]",
-        "6|    return quicksort(less) + [pivot] + quicksort(greater)",
-        "出力（block と symbol を両方使う例。複数行のまとまりは block、行内の1点は symbol）:",
-        '[{"kind":"block","severity":"info","startLine":3,"endLine":6,"startLineText":"    pivot = arr[0]","endLineText":"    return quicksort(less) + [pivot] + quicksort(greater)","label":"pivot未満と超過に振り分け、各々を再帰整列してpivotを挟んで連結する","explanation":"平均O(n log n)。ただしpivot=arr[0]はソート済み入力でO(n²)に劣化する"},',
-        ' {"kind":"symbol","severity":"info","line":4,"lineText":"    less = [x for x in arr[1:] if x <= pivot]","token":"arr[1:]","label":"pivotを除いた残りの要素","explanation":"pivotに使ったarr[0]を除いた2番目以降の要素。ここをarrのままにするとpivot自身が比較され、左右どちらにも入って要素が二重に数えられてしまう"}]',
-        "（warning の例: {\"kind\":\"symbol\",\"severity\":\"warning\",...,\"label\":\"問題: 空入力でIndexErrorになる\",\"explanation\":\"問題: 空リストを渡すと例外で落ちる。条件: arrが空の時。影響: arr[0]の参照でIndexErrorになり処理が止まる。\"}）",
-        "注意: `return arr`(line2) や `pivot = arr[0]`(line3) 単独は自明なので選ばない。1行に独立した注目点が複数あれば別々に付けてよいが、範囲が重なるトークンは選ばない。",
-        "",
-        "## 返却形式（JSONのみ、マークダウン不可）",
-        '- 行内の式: {"kind":"symbol","severity":"info"|"warning","line":N,"lineText":"その行を丸コピー","token":"下線を引く部分文字列","label":"短い見出し","explanation":"詳しい説明"}',
-        '- 複数行: {"kind":"block","severity":"info"|"warning","startLine":N,"endLine":M,"startLineText":"先頭行を丸コピー","endLineText":"末尾行を丸コピー","label":"短い見出し","explanation":"詳しい説明"}',
-        "",
-        "## ルール（厳守）",
-        "- lineText / startLineText / endLineText は対象行を一字一句そのままコピーする（先頭の `N|` は含めない）",
-        "- token は lineText の中に必ず含まれる部分文字列にする",
-        "- line / startLine / endLine は対象行の N をそのまま書く（数え直さない）",
-        "- label は step1（常時表示・流れ・symbol 20〜30字 / block 40〜50字）。explanation は step2（ホバー本文・symbol 60〜120字で単体完結 / block 30〜60字でlabelの一段深く）",
-        "- warning の label/explanation は上の warning ルールを優先し、長さより問題点の明確さを優先する",
-        "- 同じ行に複数付けてよいが、範囲が重なる/入れ子のトークンは選ばない（独立したトークンのみ）",
-        "- blockに制御文を含めるならstartLineTextは必ずそのif/for/while/try/with/match行。直前のcall代入はblock外のsymbolとして返す",
-        "- 固定件数や件数上限はない。選定基準に該当する対象は省かず、該当しない自明な箇所で件数を水増ししない",
-        globalCtx ? `読者のコンテキスト: ${globalCtx}` : "",
-    ]
-        .filter(Boolean)
-        .join("\n");
-
-    const targetHints = annotationTargetHints(code);
-    const userPrompt = [
-        '以下のPythonコード（各行頭の "N|" は行番号）に解説をつけてください:',
-        "```",
-        numbered,
-        "```",
-        targetHints.length ? "\n識別子説明の見落とし防止候補です。選定基準に従い、project固有対象・assertXxx・withは必ず含めてください:" : "",
-        ...targetHints.map((hint) => `- ${hint}`),
-    ].filter(Boolean).join("\n");
-
-    const requestAnnotations = async (
-        requestSystem: string,
-        requestUser: string,
-        operation: string,
-        outputTokens: number,
-    ): Promise<SemanticAnnotation[]> => {
-        const message = await createMessage({
-            model: getInlineAnnotationModel(),
-            max_tokens: outputTokens,
-            system: requestSystem,
-            messages: [{ role: "user", content: requestUser }],
-        });
-        trackUsage(message.usage, operation, message.model);
-        const text = message.content[0].type === "text" ? message.content[0].text : "[]";
-        let raw: RawAnnotation[];
-        try {
-            raw = JSON.parse(extractJsonStr(text, true)) as RawAnnotation[];
-        } catch {
-            raw = salvageJsonObjects(text) as RawAnnotation[];
-            logRawFailure(operation, text, raw.length);
-        }
-        return resolveAnnotations(raw, code);
-    };
-
-    let annotations = await requestAnnotations(
-        systemPrompt,
-        userPrompt,
-        "generateSemanticAnnotations",
-        maxTokens,
-    );
-
-    // AI_NOTE: 「生成」操作は1回のまま、モデルが必須対象を落とした時だけ内部で不足分を補完する。
-    // 固定件数への水増しではなく、実コードから導いたimport/constructor/assert/withだけを検査する。
-    for (let attempt = 1; attempt <= 2; attempt++) {
-        const missing = missingRequiredAnnotationTargets(code, annotations);
-        if (missing.length === 0) return annotations;
-        const repairSystem = [
-            systemPrompt,
-            "",
-            "## 必須カバレッジ補完",
-            "次の依頼では、列挙された不足対象だけを1対象1件で返してください。既にある対象や別の箇所は返しません。",
-            "importは指定tokenを下線にするsymbol、constructor代入は変数名を下線にするsymbol、withはそのwith行から始まるblockにします。",
-            "with self.assertRaises(...)はassert symbolを重ねず、with行から始まる1つのblockで両方を説明します。",
-        ].join("\n");
-        const repairUser = [
-            "以下のコードに対し、不足対象をすべて補うJSON配列だけを返してください:",
-            "```",
-            numbered,
-            "```",
-            ...missing.map((target) => {
-                const token = target.token ? ` / token=${JSON.stringify(target.token)}` : "";
-                return `- kind=${target.kind} / line=${target.line}${token} / code=${JSON.stringify(sourceLines[target.line] ?? "")} / 必須説明=${target.description}`;
-            }),
-        ].join("\n");
-        const repaired = await requestAnnotations(
-            repairSystem,
-            repairUser,
-            `generateSemanticAnnotationsRepair${attempt}`,
-            Math.min(maxTokens, Math.max(2048, missing.length * 512)),
-        );
-        annotations = dedupAnnotations([...annotations, ...repaired]);
-    }
-
-    const missing = missingRequiredAnnotationTargets(code, annotations);
-    if (missing.length > 0) {
-        const summary = missing.map((target) => `${target.line + 1}:${target.token ?? target.kind}`).join(", ");
-        throw new Error(`必須のインライン解説を生成できませんでした: ${summary}`);
-    }
-    return annotations;
-}
-
 function fallbackSymbolExplanation(item: SymbolOccurrence): string {
     if (item.kind === "variable") return `${item.display}が保持する値です。代入元と利用箇所から意味を確認できます。`;
     if (item.kind === "method") return `${item.display}が受け取る値、行う処理、返す値を定義から確認できます。`;
@@ -1457,57 +1151,83 @@ function fallbackSymbolExplanation(item: SymbolOccurrence): string {
     return `${item.display}が表すもの、または担当する役割を定義から確認できます。`;
 }
 
+// AI_NOTE: exact-file cacheと増分cacheの双方が、説明生成へ影響する設定を同じ条件で失効させる。
+// API keyそのものは説明内容へ影響しないため含めず、利用可否だけを含める。
+export function symbolDictionaryCacheIdentity(): string {
+    const configuredModel = getInlineAnnotationModel();
+    return buildSymbolDictionaryCacheIdentity({
+        model: effectiveModel(configuredModel),
+        globalContext: getGlobalContext(),
+        providerAvailable: hasApiKey(configuredModel),
+    });
+}
+
 // AI_NOTE: 対象選定はLLMへ任せずAST結果を全件使う。LLMは名称ごとの短い辞書文だけを作り、
-// 欠落・JSON失敗時もfallbackで全出現位置を維持する。
+// AI_NOTE: 同一scope/依存証拠の名称を一括入力にし、JSON欠落やprovider失敗を成功キャッシュへ昇格させない。
 export async function generateSymbolDictionaryAnnotations(
     code: string,
     occurrences: SymbolOccurrence[],
+    cached: SemanticAnnotation[] = [],
+    force = false,
+    options: { isCurrent?: () => boolean; onProgress?: (annotations: SemanticAnnotation[]) => void } = {},
 ): Promise<SemanticAnnotation[]> {
     if (occurrences.length === 0) return [];
     const unique = [...new Map(occurrences.map((item) => [item.key, item])).values()];
-    const descriptions = new Map(unique.map((item) => [item.key, fallbackSymbolExplanation(item)]));
-    if (hasApiKey(getInlineAnnotationModel())) {
-        const targets = unique.map((item) => ({
-            key: item.key,
-            kind: item.kind,
-            name: item.display,
-            scope: item.scope,
-            examples: occurrences.filter((candidate) => candidate.key === item.key).slice(0, 3).map((candidate) => candidate.context),
-        }));
+    const descriptions = new Map<string, string>();
+    const evidence = buildSymbolGenerationEvidence(code, occurrences);
+    const reuse = planSymbolDescriptionReuse(code, occurrences, cached, force);
+    for (const [key, explanation] of reuse.reusedDescriptions) descriptions.set(key, explanation);
+    const render = (): SemanticAnnotation[] => occurrences.flatMap((item) => {
+        const explanation = descriptions.get(item.key);
+        if (!explanation) return [];
+        const uncertain = evidence.get(item.key)!.uncertainty.length > 0;
+        const annotation = buildSymbolAnnotation(code, item, uncertain
+            ? `文脈の再確認が必要: ${explanation.replace(/^文脈の再確認が必要: /, "")}` : explanation);
+        return annotation ? [{ ...annotation, symbolFingerprint: reuse.fingerprints.get(item.key) }] : [];
+    });
+    const missing = unique.filter((item) => reuse.missingKeys.has(item.key));
+    if (missing.length > 0) {
+        if (!hasApiKey(getInlineAnnotationModel())) throw new Error("名称解説の生成に利用できるモデル接続がありません。");
         const system = [
             "Pythonコード中の名称を、知らない読者がその場で調べるための短い辞書文にしてください。",
             "重要性の判断、設計評価、複数行処理の要約はしません。入力された全keyへ1件ずつ返してください。",
             "variable: 何の値を保持するか。分かれば代入元も含める。",
-            "function/method: 何を受け取り、何をして、何を返すか。コードで不明なら不明と書く。",
+            "function/method: 何を受け取り、何をして、何を返すか。Pythonの組込機能は通常のPython仕様に沿って説明する。",
             "class: 何を表すか、または何を担当するか。",
             "40〜100文字の日本語1文。入力から確認できない内容を推測しない。",
+            "入力はこの名称群だけの根拠です。definitionsにない参照定義を推測しない。uncertaintyは文脈の再確認が必要な参照です。",
+            "knownPython.builtinsは同名の字句定義/importに隠されていない組込名です。list/dict/sorted等を、ユーザー定義がないだけで処理・戻り値不明としない。",
+            "knownPython.conditionalMethodsは標準型での意味です。receiverの型が確定できなければ『文字列の場合は…』等の条件付きで通常の働きを説明する。型の不明とメソッドの一般的な意味の不明を混同しない。",
+            "既知の組込仕様とコードのつながりから、変数が保持する値の意味も具体的に説明する。外部関数や動的dispatchの結果を断定してはいけない。",
             'JSONのみ: {"items":[{"key":"入力のkey","explanation":"短い説明"}]}',
             getGlobalContext() ? `読者のコンテキスト: ${getGlobalContext()}` : "",
         ].filter(Boolean).join("\n");
-        try {
+        // AI_NOTE: batch全体の入力を固定する。未開始分だけ停止でき、送信済み費用の取消は保証しない。
+        for (const batch of buildSymbolGenerationBatches(code, occurrences)) {
+            if (!batch.targets.some(target => reuse.missingKeys.has(target.key))) continue;
+            if (options.isCurrent && !options.isCurrent()) throw new Error("名称解説の未開始生成を停止しました。");
             const message = await createMessage({
                 model: getInlineAnnotationModel(),
-                max_tokens: Math.min(16384, Math.max(1024, unique.length * 120)),
+                max_tokens: Math.min(16384, Math.max(1024, batch.targets.length * 160)),
                 system,
-                messages: [{ role: "user", content: `コード:\n\n${code}\n\n名称一覧:\n${JSON.stringify(targets)}` }],
+                messages: [{ role: "user", content: JSON.stringify(batch) }],
             });
             trackUsage(message.usage, "generateSymbolDictionaryAnnotations", message.model);
             const text = message.content[0]?.type === "text" ? message.content[0].text : "{}";
             const parsed = JSON.parse(extractJsonStr(text)) as { items?: Array<{ key?: unknown; explanation?: unknown }> };
-            for (const item of parsed.items ?? []) {
-                if (typeof item.key === "string" && descriptions.has(item.key)
-                    && typeof item.explanation === "string" && item.explanation.trim()) {
-                    descriptions.set(item.key, item.explanation.trim().slice(0, 240));
-                }
+            const items = parsed.items;
+            const keys = new Set(batch.targets.map(target => target.key));
+            if (!Array.isArray(items) || items.length !== keys.size
+                || new Set(items.map(item => item.key)).size !== keys.size
+                || items.some(item => typeof item.key !== "string" || !keys.has(item.key)
+                    || typeof item.explanation !== "string" || !item.explanation.trim())) {
+                throw new Error(`名称解説の出力が不正です: ${batch.targets.map(target => target.name).join(", ")}`);
             }
-        } catch (error) {
-            console.warn("generateSymbolDictionaryAnnotations fallback:", error);
+            for (const item of items) descriptions.set(item.key as string, (item.explanation as string).trim().slice(0, 240));
+            options.onProgress?.(render());
         }
     }
-    return occurrences.flatMap((item) => {
-        const annotation = buildSymbolAnnotation(code, item, descriptions.get(item.key) ?? fallbackSymbolExplanation(item));
-        return annotation ? [annotation] : [];
-    });
+    return render();
 }
 
 export async function refineSymbolDictionaryExplanation(args: {
@@ -1564,7 +1284,7 @@ export async function answerAnnotationQuestion(
     const globalCtx = getGlobalContext();
 
     const systemPrompt = [
-        "あなたはPythonコードの解説アシスタントです。",
+        "あなたはコードの解説アシスタントです。",
         "ユーザーはコードの特定の箇所についての解説を見て、追加質問をしています。",
         "簡潔かつ正確に日本語で答えてください（2〜5文程度）。",
         globalCtx ? `読者のコンテキスト: ${globalCtx}` : "",
@@ -1666,6 +1386,15 @@ Follow-up question: ${question}`;
         : "No answer available.";
 }
 
+function codeFenceForFileName(fileName: string): string {
+    const lower = fileName.toLowerCase();
+    if (lower.endsWith(".tsx")) return "tsx";
+    if (lower.endsWith(".ts") || lower.endsWith(".mts") || lower.endsWith(".cts")) return "typescript";
+    if (lower.endsWith(".jsx")) return "jsx";
+    if (lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) return "javascript";
+    return "python";
+}
+
 export async function chatAboutCode(
     history: Array<{ role: "user" | "assistant"; content: string; quotes?: Array<{ code: string; explanation?: string; fileName?: string; lineStart?: number; lineEnd?: number }> }>,
     fileContent: string,
@@ -1674,8 +1403,9 @@ export async function chatAboutCode(
     signal?: AbortSignal
 ): Promise<string> {
     const globalCtx = getGlobalContext();
+    const fileFence = codeFenceForFileName(fileName);
     const systemPrompt = [
-        `You are a code assistant. The user is viewing a flowchart/module map of a Python file named "${fileName}".`,
+        `You are a code assistant. The user is viewing a flowchart/module map of a code file named "${fileName}".`,
         "Answer questions about the code concisely. Use Japanese.",
         // AI_NOTE: 引用はメッセージ添付型。本文中の「(引用N)」「引用N」はそのメッセージに添付されたN番目の引用を指す（UIがインラインチップに置換して表示する）。
         "Within a user message, the tokens (引用N) or 引用N refer to the Nth quoted code block attached to that same message (numbered starting at 1).",
@@ -1689,14 +1419,14 @@ export async function chatAboutCode(
             .map((q, i) => {
                 const lines = q.lineStart == null ? "" : q.lineStart === q.lineEnd ? `${q.lineStart}行目` : `${q.lineStart}-${q.lineEnd}行目`;
                 const loc = lines ? `（${q.fileName ?? fileName} ${lines}）` : "";
-                return `引用${i + 1}${loc}:\n\`\`\`python\n${q.code}\n\`\`\`${q.explanation ? `\n解説: ${q.explanation}` : ""}\n\n`;
+                return `引用${i + 1}${loc}:\n\`\`\`${codeFenceForFileName(q.fileName ?? fileName)}\n${q.code}\n\`\`\`${q.explanation ? `\n解説: ${q.explanation}` : ""}\n\n`;
             })
             .join("");
 
     // 最初のユーザーメッセージにファイル内容を埋め込む。各userメッセージは引用ブロック→本文の順
     const messages = history.map((m, i) => {
         if (m.role !== "user") return { role: m.role, content: m.content };
-        const filePart = i === 0 ? `ファイル: ${fileName}\n\`\`\`python\n${fileContent}\n\`\`\`\n\n` : "";
+        const filePart = i === 0 ? `ファイル: ${fileName}\n\`\`\`${fileFence}\n${fileContent}\n\`\`\`\n\n` : "";
         return { role: "user" as const, content: `${filePart}${m.quotes?.length ? quoteBlock(m.quotes) : ""}${m.content}` };
     });
 
@@ -1731,75 +1461,67 @@ export async function answerHelpQuestion(question: string, helpDoc: string): Pro
     return message.content[0].type === "text" ? message.content[0].text : "";
 }
 
-// AI_NOTE: chatLink注釈の中身。結論は1つだが、下線(symbol)と枠(block)で入る欄の幅が違うので常時表示labelを2段の長さで持つ。
-// symbolLabel=短い版(下線・CodeLens1行/通常symbol labelの20〜30字に整合)/blockLabel=濃い版(枠・複数行サイドノート/通常block labelの40〜50字に整合)。
-// explanation=ホバー用の補足(1文)。呼び出し側が注釈のkindでsymbol/blockLabelを選ぶ。内容は同じ結論で長さ(詳しさ)だけ違う。
+// AI_NOTE: 会話の結論を名称Hoverへ戻すための要約。対象は実コード中の名称(symbol)だけに限定する。
 export interface ChatConclusion {
-    symbolLabel: string;
-    blockLabel: string;
+    label: string;
     explanation: string;
     targets: RawAnnotation[];
 }
 
-// AI_NOTE: LLM境界の4行形式を純粋関数で検証する。壊れた/余分なJSON対象は捨てても、会話本文用の結論は維持する。
+// AI_NOTE: LLM境界の3行形式を純粋関数で検証する。壊れた/余分なJSON対象は捨てても、会話本文用の結論は維持する。
 export function parseChatConclusion(text: string): ChatConclusion {
-    const fallback: ChatConclusion = { symbolLabel: "会話メモ", blockLabel: "会話メモ", explanation: "", targets: [] };
+    const fallback: ChatConclusion = { label: "会話メモ", explanation: "", targets: [] };
     const lines = text.trim().split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
-    const symbolLabel = normalizeLabelLine(lines[0] ?? "");
-    const blockLabel = normalizeLabelLine(lines[1] ?? lines[0] ?? "");
-    const explanation = capText(lines[2] || lines[1] || lines[0] || "", 120);
+    const label = normalizeLabelLine(lines[0] ?? "");
+    const explanation = capText(lines[1] || lines[0] || "", 120);
     let targets: RawAnnotation[] = [];
     try {
-        const parsed = JSON.parse(extractJsonStr(lines.slice(3).join("\n"), true)) as unknown;
+        const parsed = JSON.parse(extractJsonStr(lines.slice(2).join("\n"), true)) as unknown;
         if (Array.isArray(parsed)) {
             targets = parsed.filter((value): value is RawAnnotation => {
                 if (!value || typeof value !== "object") return false;
                 const item = value as Partial<RawAnnotation>;
-                if (item.kind === "symbol") return typeof item.lineText === "string" && typeof item.token === "string";
-                return item.kind === "block" && typeof item.startLineText === "string" && typeof item.endLineText === "string";
+                return item.kind === "symbol" && typeof item.lineText === "string" && typeof item.token === "string";
             }).slice(0, 3);
         }
     } catch {
         targets = [];
     }
-    return (symbolLabel || blockLabel) ? { symbolLabel, blockLabel, explanation, targets } : fallback;
+    return label ? { label, explanation, targets } : fallback;
 }
 
 // AI_NOTE: 引用箇所についての会話「全体」から、その箇所の結論(=コードの解説)を要約する。会話が進むたびに呼び直して
 // 最新の結論へ更新する想定(凍結しない)。まだ結論が出ていない途中でも、その時点の暫定的な要点を返す(「質問中」は返さない)。
-// 4行(symbol短文/block長文/explanation/対象JSON)で受ける。品質モデル(getChatModel)を使い構造系(getModel)とは分ける。
+// 3行(label/explanation/対象JSON)で受ける。品質モデル(getChatModel)を使い構造系(getModel)とは分ける。
 // 失敗・未設定時は例外を投げず暫定fallbackを返す(注釈生成の失敗でチャット本体を壊さないため)。
 export async function summarizeChatConclusion(transcript: string, code: string, signal?: AbortSignal): Promise<ChatConclusion> {
-    const fallback: ChatConclusion = { symbolLabel: "会話メモ", blockLabel: "会話メモ", explanation: "", targets: [] };
+    const fallback: ChatConclusion = { label: "会話メモ", explanation: "", targets: [] };
     // AI_NOTE: 会話「理解」タスクなので品質モデル(getChatModel=既定Sonnet)を使う。構造系(getModel=Haiku)は書式を守らず
     // プロンプトの語をechoしたり「理解:」等の接頭辞を付けるため不適(実機で確認)。会話系は元々Sonnet相当で品質が出る。
     if (!hasApiKey(getChatModel())) return fallback;
 
     // AI_NOTE: 傍観者として指示し会話への応答を防ぐ。結論未確定でも暫定要点を出させる(「質問中」等の非情報は禁止)。
     // labelは常時表示され、label単体で意味が分かる必要があるので『〜の理由』等の話題見出しを明示禁止し結論の中身を平叙文で述べさせる。
-    // 下線と枠で欄幅が違うため短い版(symbol)と濃い版(block)を1回で両方出させる。同じ結論を長さだけ変える。良い例/悪い例で誘導。
-    // AI_NOTE: 4行目のJSONは、引用なしの質問でもコード本文へ安全に再照合できる位置情報。行番号ではなく実テキストを正とする。
+    // AI_NOTE: 3行目のJSONは、引用なしの質問でもコード本文へ安全に再照合できる位置情報。行番号ではなく実テキストを正とする。
     const systemPrompt = [
         "コードについての会話を読み、この箇所が何をしている/なぜこうなっているかの結論を要約する。会話には応答しない。",
         "まだ途中でもその時点の暫定的な要点を書く(「質問中」「回答待ち」等は書かない)。",
         "最重要: 各行は『話題の見出し』ではなく、それ単体を読んで意味が分かる『結論の中身そのもの』を事実の平叙文で書く。",
         "『〜の理由』『〜について』『〜とは』『〜の仕組み』のような話題名だけの見出しは禁止(それだけ読んでも何が結論か分からないため)。",
         "接頭辞(『見出し:』『理解:』『結論:』等)・記号・引用符は付けない。",
-        "出力はちょうど4行。1〜3行目の字数は厳守し、超えそうなら条件の列挙や修飾を削って言い切る:",
-        "1行目=短い版。この箇所が何をするかだけを端的に(全角25字以内)。理由・条件の列挙は入れない。",
-        "2行目=詳しい版。同じ結論をなぜ/どうやってまで含めて1文で(全角50字以内)。",
-        "3行目=ホバー用の補足(全角30〜60字)。1・2行目の丸写しにしない。",
-        "4行目=最新の質問と回答が、表示中コードの具体的な箇所について再利用できる解説なら、その対象をJSON配列で最大3件。挨拶、一般的なPythonの質問、拡張の使い方、場所を特定できない質問は []。",
-        'symbolは {"kind":"symbol","line":N,"lineText":"対象行をコードから丸コピー","token":"対象部分を丸コピー"}。blockは {"kind":"block","startLine":N,"endLine":M,"startLineText":"先頭行を丸コピー","endLineText":"末尾行を丸コピー"}。N/Mは入力の0始まり番号をそのまま使う。説明文はJSONへ入れない。',
-        "会話全体ではなく、最新の質問とその回答で新しく説明された箇所だけを4行目へ入れる。質問でコードを引用していなくても、関数名・変数名・処理内容から一意に分かれば対象にする。",
-        "良い例(無関係なコードの、1〜3行目の順。1行目がこの位短いことに注意):",
+        "出力はちょうど3行。1〜2行目の字数は厳守し、超えそうなら条件の列挙や修飾を削って言い切る:",
+        "1行目=名称Hoverの見出し。この名称が何をするかだけを端的に(全角25字以内)。",
+        "2行目=ホバー用の補足(全角30〜60字)。1行目の丸写しにしない。",
+        "3行目=最新の質問と回答が、表示中コードの具体的な名称について再利用できる解説なら、その対象をJSON配列で最大3件。挨拶、一般的なPythonの質問、拡張の使い方、場所を特定できない質問は []。",
+        '対象は名称だけ。{"kind":"symbol","line":N,"lineText":"対象行をコードから丸コピー","token":"変数・関数・メソッド・クラス名を丸コピー"}。blockや式・演算子・文字列は返さない。Nは入力の0始まり番号をそのまま使い、説明文はJSONへ入れない。',
+        "会話全体ではなく、最新の質問とその回答で新しく説明された名称だけを3行目へ入れる。質問でコードを引用していなくても名称から一意に分かれば対象にする。",
+        "良い例(無関係なコードの、1〜2行目の順。1行目がこの位短いことに注意):",
         "キー不在でもget(k,0)で既定値0を返す",
-        "存在チェックのif分岐を書かず、未登録キーもget(k,0)の既定値0でそのまま加算できる。",
         "だからカウント集計などで初出キーの前処理が要らない。",
         "悪い例(1行目): 『辞書のgetの理由』…話題名だけで結論の中身がなく、label単体では意味が分からない。",
     ].join("\n");
     const numberedCode = code.replace(/\r\n/g, "\n").split("\n").map((line, index) => `${index}|${line}`).join("\n");
-    const userPrompt = `コード（各行頭のN|は0始まりの行番号）:\n\`\`\`python\n${numberedCode}\n\`\`\`\n\n会話:\n${transcript}`;
+    const userPrompt = `コード（各行頭のN|は0始まりの行番号）:\n\`\`\`\n${numberedCode}\n\`\`\`\n\n会話:\n${transcript}`;
 
     try {
         const message = await createMessage({
@@ -1817,10 +1539,7 @@ export async function summarizeChatConclusion(transcript: string, code: string, 
     }
 }
 
-// AI_NOTE: 常時表示label用の整形。先頭1行だけ取り、前後の記号(箇条書き・引用符)とメタ接頭辞を落とすだけで、
-// 長さは切らない。通常のsymbol/block labelは固定長カットを通さず返り値を全表示しており、chatlinkだけ「…」が付くと
-// 不整合になるため揃える(…で切ると常時表示の情報が消える。memory inline-label-full-not-truncated)。多行の暴走は
-// lines[0]抽出で既に防いでおり、長すぎる時はレイアウト側で収める(=他labelと同じ扱い)。
+// AI_NOTE: Hover見出し用の整形。先頭1行だけ取り、前後の記号とメタ接頭辞を落とす。
 function normalizeLabelLine(text: string): string {
     const firstLine = text.trim().split(/\r?\n/)[0].replace(/\s+/g, " ").trim();
     // AI_NOTE: 弱いモデルが付けがちなメタ接頭辞(見出し:/結論:/理解:/要点:/ラベル:)を1つだけ剥がす。全/半角コロン対応。

@@ -171,7 +171,7 @@ function buildHelpPageHtml(webview: vscode.Webview, extensionPath: string): stri
 <div class="wrap">
   <header class="hero">
     <h1>AI Code Guide の使い方</h1>
-    <p class="lead">Python コードの理解を助ける拡張機能です。大きく2つの柱があります。</p>
+    <p class="lead">Python・JavaScript・TypeScriptコードの理解を助ける拡張機能です。構造・解説・コード図を共通の画面で扱います。</p>
     ${axisDiagram}
     <div class="toc">
       <a href="#setup">1. 認証（セットアップ）</a>
@@ -203,7 +203,7 @@ function buildHelpPageHtml(webview: vscode.Webview, extensionPath: string): stri
 
   <section id="flow">
     <h2>2. フローチャート / マップ</h2>
-    <p>コードの構造をカードと図で見る機能です。Python ファイルを開いて ${kbd("⌘⌥V")}（Win/Linux: ${kbd("Ctrl+Alt+V")}）。保存すると自動更新されます。</p>
+    <p>コードの構造をカードと図で見る機能です。対応コードファイルを開いて ${kbd("⌘⌥V")}（Win/Linux: ${kbd("Ctrl+Alt+V")}）。保存すると自動更新されます。</p>
 
     <div class="frow">
       <div>
@@ -238,49 +238,27 @@ function buildHelpPageHtml(webview: vscode.Webview, extensionPath: string): stri
     <h3>その他のタブ</h3>
     <ul>
       <li><b>概要</b>：ファイルを意味のグループでまとめた俯瞰ビュー。</li>
-      <li><b>プロジェクト</b>：ワークスペース全体の Python ファイルと <b>import 依存</b>（○→▶）。参照を押すと関連ファイルが強調されます。</li>
+      <li><b>プロジェクト</b>：ワークスペース全体の対応コードファイルと <b>import 依存</b>（○→▶）。参照を押すと関連ファイルが強調されます。</li>
     </ul>
     <p><button class="btn" data-cmd="aiCodeGuide.showFlowchart">いま開いているファイルで表示</button></p>
   </section>
 
   <section id="inline">
-    <h2>3. インライン意味解説</h2>
-    <p>コードの「説明したほうがいい所」をAIが選び、エディタの中に直接、解説を表示します。Python ファイルで ${kbd("⌘⌥E")}（Win/Linux: ${kbd("Ctrl+Alt+E")}）を押すと<b>ファイル全体</b>に生成します。</p>
-    <h3>解説の出かた（2種類）</h3>
-    <div class="row">
-      <div class="card">
-        <p><b>単語・記号への解説</b></p>
-        <p>コード中の語に<b>点線の下線</b>が引かれ、<b>そのすぐ下の行に解説</b>が出ます（同じ行に複数あるときは ①② で対応）。</p>
-        ${shot(webview, extensionPath, "inline-symbol.png", "点線下線＋すぐ下の行に解説")}
-      </div>
-      <div class="card">
-        <p><b>まとまり（複数行）への解説</b></p>
-        <p>右の余白に解説が出て、<b>その範囲を縦の括弧（] のような形）で示します</b>。コード自体は枠で囲みません。</p>
-        ${shot(webview, extensionPath, "inline-block.png", "右余白に解説、範囲を ] で表示")}
-      </div>
-    </div>
-    <h3>色で種類がわかる</h3>
-    <p><span class="tag info">オレンジ</span>ふつうの解説　<span class="tag warn">赤</span>バグ・問題の指摘</p>
-    <h3>たくさん出ても埋もれない仕組み</h3>
-    <p>解説が増えても埋もれないよう、いくつかの操作で表示を絞れます。<b>いちばん手軽なのがトリアージ</b>（各解説の行末に出る 読んだ／後で／解決 の<b>押せるボタン</b>）です：</p>
-    ${shot(webview, extensionPath, "triage-demo.png", "実画面：① 行末の 読んだ／後で／解決 は押せるボタン ② 解決にすると薄く→既定で非表示になり埋もれない")}
-    <p style="margin-top:16px;">ほかの絞り込みは、<b>チャットタブの表示コントロール</b>にまとまっています（右の実画面の色枠）：</p>
-    <div class="frow">
-      <div>
-        <ul>
-          <li><b>① 範囲を解析</b>：コードを選択して押すと、その部分だけ解説します（コードを右クリック →「この範囲を解説」でも同じ）。</li>
-          <li><b>② 密度</b>：解説の件数を <b>最小／標準／密／超密</b> で調整。多いほど詳しいがトークン消費大。増えて埋もれたら下げると見やすい。</li>
-          <li><b>③ ⚠ 警告のみ</b>：赤いバグ指摘だけに絞る。コードを読む前に危険箇所だけ確認したいとき。</li>
-        </ul>
-      </div>
-      <div>${shot(webview, extensionPath, "controls-demo.png", "チャットタブの表示コントロール：① 範囲を解析 ② 密度 ③ 警告のみ")}</div>
-    </div>
-    <p class="note">消すには ${kbd("⌘⌥C")}（またはコードを編集）。ホバーで詳細、「質問する」リンクでチャット質問も。</p>
+    <h2>3. 名称辞書</h2>
+    <p>Python ファイルで ${kbd("⌘⌥E")}（Win/Linux: ${kbd("Ctrl+Alt+E")}）を押すと、変数・関数・メソッド・クラスの短い説明を生成します。</p>
+    <p>コードの見た目は変わりません。知りたい名称へマウスを置くと、種類・説明・質問ボタンがポップアップします。</p>
+    <ul>
+      <li><b>名称辞書</b>：ファイル全体を生成。保存済みの説明は再利用します。</li>
+      <li><b>範囲を解析</b>：選択した範囲だけを追加生成します。</li>
+      <li><b>説明を再生成</b>：名称は変えず、説明文を作り直します。</li>
+      <li><b>名称辞書を表示</b>：生成結果を消さずに Hover の ON/OFF を切り替えます。</li>
+    </ul>
+    <p>実行トレースと同時に使えます。トレースを消さなくても名称へ Hover できます。</p>
     <p><button class="btn" data-cmd="aiCodeGuide.explainBlockInline">いま開いているファイルで生成</button></p>
   </section>
 
   <section id="keys">
-    <h2>ショートカット（Pythonエディタ）</h2>
+    <h2>ショートカット（対応コードのエディタ）</h2>
     <table class="keys">
       <tr><td>フローチャートを表示</td><td>${kbd("⌘⌥V")} / ${kbd("Ctrl+Alt+V")}</td></tr>
       <tr><td>インライン解説を生成</td><td>${kbd("⌘⌥E")} / ${kbd("Ctrl+Alt+E")}</td></tr>
@@ -295,7 +273,8 @@ function buildHelpPageHtml(webview: vscode.Webview, extensionPath: string): stri
     <h2>困ったとき</h2>
     <ul>
       <li><b>解説が出ない／「分解できませんでした」</b>：認証が未設定か通信失敗の可能性。設定タブで APIキー / サブスクを確認。</li>
-      <li><b>何も解析されない</b>：<code>python3</code> が PATH にあるか確認（フローチャート解析に必要）。</li>
+      <li><b>Pythonだけ解析されない</b>：<code>python3</code> が PATH にあるか確認。JavaScript/TypeScript解析器は拡張へ同梱されています。</li>
+      <li><b>実行トレースが使えない</b>：現在はPythonだけに対応しています。他言語では構造・概要・図・解説・チャットを利用できます。</li>
       <li><b>更新したのに変わらない</b>：<code>.vsix</code> は自動更新されません。新しい版を入れたら VS Code を再読み込み（${kbd("⌘⇧P")} →「Reload Window」）。</li>
     </ul>
   </section>

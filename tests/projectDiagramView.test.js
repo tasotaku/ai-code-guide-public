@@ -169,7 +169,7 @@ for (const [view, tab] of Object.entries({ standard: "standard", overview: "over
     assert.ok(agentMethod.includes(`${view}: "${tab}"`));
 }
 assert.ok(agentMethod.includes("await this.refresh(document)"));
-assert.ok(agentMethod.includes("Python files only"));
+assert.ok(agentMethod.includes("Supported code files only"));
 assert.ok(agentMethod.includes("this.suppressActiveEditorRefresh = true"));
 assert.ok(agentMethod.includes("this.suppressActiveEditorRefresh = false"));
 assert.ok(agentMethod.includes('request.view === "standard" && request.line'));
@@ -245,9 +245,8 @@ ok("外部AIの図生成は会話表示用データを返し、受け渡し用HT
 
 assert.ok(agentMethod.includes('"aiCodeGuide.explainBlockInline"'));
 assert.ok(agentMethod.includes('"aiCodeGuide.explainSelection"'));
-assert.ok(agentMethod.includes("this.traceProvider?.isActive(editor.document.uri.toString())"));
-assert.ok(agentMethod.includes("if (activate && editor && this.traceProvider?.isActive"));
-assert.ok(agentMethod.includes("this.traceProvider.clear(editor)"));
+assert.ok(!agentMethod.includes("this.traceProvider?.isActive(editor.document.uri.toString())"));
+assert.ok(!agentMethod.includes("this.traceProvider.clear(editor)"));
 assert.ok(agentMethod.includes("inlineResult.status === \"empty\""));
 assert.ok(agentMethod.includes("this.annotationProvider.getSavedAnnotationsForDocument(document)"));
 assert.ok(agentMethod.includes("this.annotationProvider.annotateDocument("));
@@ -263,7 +262,6 @@ assert.ok(agentMethod.includes("item.endLine + 1 >= contextStart && item.startLi
 assert.ok(agentMethod.includes("label: contextLabel"));
 assert.ok(agentMethod.includes("startCol: item.startCol"));
 assert.ok(agentMethod.includes("endCol: item.endCol"));
-assert.ok(agentMethod.indexOf("this.traceProvider.clear(editor)") < agentMethod.indexOf('"aiCodeGuide.explainBlockInline"'));
 assert.ok(agentMethod.indexOf('"aiCodeGuide.explainBlockInline"') < agentMethod.lastIndexOf("this.annotationProvider.getSavedAnnotationsForDocument(document)"));
 assert.ok(annotationSource.includes("getSavedAnnotations(editor: vscode.TextEditor)"));
 const savedAnnotationsMethod = annotationSource.slice(
@@ -271,9 +269,9 @@ const savedAnnotationsMethod = annotationSource.slice(
     annotationSource.indexOf("clearEditor(editor: vscode.TextEditor)"),
 );
 assert.ok(savedAnnotationsMethod.includes("this.getSavedAnnotationsForDocument(editor.document)"));
-assert.ok(savedAnnotationsMethod.includes("this.cache.get(uri, document.getText())"));
+assert.ok(savedAnnotationsMethod.includes("this.cache.get(uri, document.getText(), symbolDictionaryCacheIdentity())"));
 assert.ok(!savedAnnotationsMethod.includes("this.activeAnnotations.get"));
-ok("トレース後のインライン要求は表示を切り替え、MCPへは永続キャッシュの生成結果を返す");
+ok("トレースを維持したままインライン名称辞書を要求でき、MCPへは永続キャッシュの生成結果を返す");
 assert.ok(agentMethod.includes("const removeIds = request.removeAnnotationIds ?? []"));
 assert.ok(agentMethod.indexOf("replaceSavedAnnotations(editor, before.filter") < agentMethod.indexOf('executeCommand<AnnotateResult>'));
 assert.ok(agentMethod.includes("replaceSavedAnnotations(editor, before)"));

@@ -1,17 +1,15 @@
 import * as fs from "fs";
 import * as path from "path";
 
-// AI_NOTE: 注釈のトリアージ状態を id 単位で永続化する。vscode 非依存にして単体テスト可能にする
-// (resolver と同じ方針)。状態は安定 id(位置由来)に紐づくので、編集・再生成をまたいで保たれる。
-// 未読は「保存しない(=mapに無い)」で表す。read/later/resolved/hidden だけ明示保存する。
-// hidden=この注釈だけ手動で非表示。resolved(解決済み)とは独立した表示制御。
-export type AnnotationStatus = "read" | "later" | "resolved" | "hidden";
+// AI_NOTE: Codex側で差し替えた旧名称カードの非表示だけを id 単位で永続化する。
+// VS Code上のトリアージ状態(read/later/resolved)は廃止済み。
+export type AnnotationStatus = "hidden";
 
 export class AnnotationStatusStore {
     private map = new Map<string, AnnotationStatus>();
     private readonly diskPath: string;
     // AI_NOTE: [レビュー] "全ファイル分の状態が無限蓄積" → AnnotationCache(LRU200)と非対称だったので上限を設ける。
-    // 状態は read/later/resolved の非クリティカル情報なので、超過時は挿入順で最古を捨てる(FIFO)。Map は挿入順を保つ。
+    // 状態は再生成できる非クリティカル情報なので、超過時は挿入順で最古を捨てる(FIFO)。Map は挿入順を保つ。
     private static readonly MAX_ENTRIES = 5000;
 
     constructor(storageDir: string) {
@@ -28,7 +26,7 @@ export class AnnotationStatusStore {
     private load(): void {
         try {
             const obj = JSON.parse(fs.readFileSync(this.diskPath, "utf8")) as Record<string, AnnotationStatus>;
-            for (const [k, v] of Object.entries(obj)) this.map.set(k, v);
+            for (const [k, v] of Object.entries(obj)) if (v === "hidden") this.map.set(k, v);
         } catch {
             // ファイルなし・破損はサイレントに空スタート
         }
@@ -43,12 +41,12 @@ export class AnnotationStatusStore {
         }
     }
 
-    // AI_NOTE: 未保存(未読)は undefined。
+    // AI_NOTE: 非表示でなければ undefined。
     get(uri: string, id: string): AnnotationStatus | undefined {
         return this.map.get(this.key(uri, id));
     }
 
-    // AI_NOTE: status=null/undefined は未読へ戻す(=削除)。それ以外は保存。どちらも即ディスク反映する。
+    // AI_NOTE: status=null は非表示を解除する。それ以外は保存。どちらも即ディスク反映する。
     set(uri: string, id: string, status: AnnotationStatus | null): void {
         const k = this.key(uri, id);
         if (status) {

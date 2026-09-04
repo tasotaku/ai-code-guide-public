@@ -12,7 +12,7 @@ Module._load = (request, parent, isMain) => request === "vscode"
     ? fakeVscode
     : originalLoad.call(Module, request, parent, isMain);
 
-const { CODEX_SUBSCRIPTION_MODEL, effectiveModel } = require("../out/api/llmProvider.js");
+const { CODEX_SUBSCRIPTION_MODEL, effectiveModel, needsWindowsCommandShell } = require("../out/api/llmProvider.js");
 assert.strictEqual(CODEX_SUBSCRIPTION_MODEL, "codex:gpt-5.6-sol");
 for (const configured of [
     "claude-haiku-4-5",
@@ -32,5 +32,9 @@ for (const configured of [
 
 values.useSubscription = false;
 assert.strictEqual(effectiveModel("gpt-5.6-terra"), "gpt-5.6-terra", "API mode must preserve explicit models");
+assert.strictEqual(needsWindowsCommandShell("C:\\Users\\tester\\AppData\\Roaming\\npm\\codex.cmd", "win32"), true);
+assert.strictEqual(needsWindowsCommandShell("C:\\tools\\codex.BAT", "win32"), true);
+assert.strictEqual(needsWindowsCommandShell("C:\\tools\\codex.exe", "win32"), false);
+assert.strictEqual(needsWindowsCommandShell("/usr/local/bin/codex.cmd", "linux"), false);
 
 console.log("LLM provider model routing: all subscription slots force codex:gpt-5.6-sol");

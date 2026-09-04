@@ -83,7 +83,7 @@ const standardHtml = buildStandardWebView({
         items: [{ id: "fn", kind: "function", label: "total()", line: 1, lineEnd: 1, color: "#4ec9b0" }],
     },
 }, "view-1");
-assert.ok(standardHtml.includes('item.expansion?"▼":"▶"'));
+assert.ok(standardHtml.includes('item.expansion&&item.expanded!==false?"▼":"▶"'));
 assert.ok(!standardHtml.includes('"詳しく読む"'));
 ok("公開標準ビューの関数カードは三角トグルで詳細を開く");
 

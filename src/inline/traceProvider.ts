@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { TraceAssertion, TraceResult, TraceLoop, TraceStep, TraceValue } from "./traceRunner";
+import { buildTracePlayback, TracePlayback } from "./tracePlayback";
 
 // AI_NOTE: 通常行(after装飾)の色。ダークはVSCodeの変数色と同系の明るい水色(視認性の指摘で
 // rgba(120,180,255,0.85)から変更)、ライトは濃紺。テーマ別は renderOptions.light/dark で出し分ける。
@@ -29,6 +30,7 @@ type TraceStates = TraceState[];
 
 export type ConversationTrace = {
     funcName: string;
+    playback?: TracePlayback;
     runId?: string;
     executedAt?: string;
     arguments?: Record<string, unknown>;
@@ -182,6 +184,8 @@ export class TraceProvider implements vscode.HoverProvider {
             });
             return {
                 funcName: state.funcName,
+                // AI_NOTE: Browser loop rows replay a self-contained recording; legacy iterations stay compatible.
+                playback: buildTracePlayback(state.trace),
                 ...(state.trace.run_id ? { runId: state.trace.run_id } : {}),
                 ...(state.trace.executed_at ? { executedAt: state.trace.executed_at } : {}),
                 ...(state.trace.input_arguments ? { arguments: state.trace.input_arguments } : {}),
@@ -364,7 +368,7 @@ export class TraceProvider implements vscode.HoverProvider {
 
     // AI_NOTE: 関数範囲の各行にafter装飾を敷く。ループヘッダ行=周回セレクタ+値(アクセント色)、
     // def行=入力例、func_line_end=戻り値(値と同居する時は戻り値を先に)、それ以外=通常の変更値。
-    // 表示列はブロック解説のサイドノートと同様に固定列へ揃える(行末直後だと開始位置がガタガタで読みにくい):
+    // 表示列は固定列へ揃える(行末直後だと開始位置がガタガタで読みにくい):
     // 関数内の最長行+2 を目標列とし、各行は margin の ch 単位で不足分を埋める(点字空白は装飾内で点に見えるためCSSで寄せる)。
     private render(editor: vscode.TextEditor, states: TraceStates): void {
         const decos: vscode.DecorationOptions[] = [];

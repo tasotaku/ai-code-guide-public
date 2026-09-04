@@ -38,6 +38,8 @@ export interface TraceAssertion {
 export interface TraceResult {
     loops: TraceLoop[];
     steps: TraceStep[];
+    // Complete recorded line visits, including unchanged values; old caches may omit this.
+    line_steps?: TraceStep[];
     // AI_NOTE: loop_id(str) → 親iter_pathキー("id:iter,id:iter"、最外は"") → 実周回数(終了判定の空周回を除く)
     iter_counts: Record<string, Record<string, number>>;
     return_value: TraceValue | null;

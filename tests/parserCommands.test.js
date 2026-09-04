@@ -144,6 +144,16 @@ assert.ok(symbols.some((item) => item.name === "report" && item.kind === "variab
 assert.ok(symbols.some((item) => item.name === "scan" && item.kind === "method"), "メソッド定義・呼出を含む");
 assert.ok(symbols.some((item) => item.name === "Scanner" && item.kind === "class"), "クラス定義・利用を含む");
 assert.strictEqual(symbols.filter((item) => item.line === 2 && item.name === "inspect").length, 1, "同じ出現位置を重複しない");
+const scanDefinition = symbols.find((item) => item.name === "scan" && item.is_definition);
+assert.deepStrictEqual(
+    [scanDefinition.scope_start, scanDefinition.scope_end],
+    [1, 3],
+    "method定義の説明fingerprintはmethod本体だけを意味scopeにする",
+);
+assert.ok(
+    symbols.filter((item) => item.key === "Scanner.scan|variable|path").every((item) => item.scope_start === 1 && item.scope_end === 3),
+    "引数と利用箇所は同じ最内側scopeを共有する",
+);
 
 const selectedSymbols = run("symbols", [], [
     "        report = scanner.scan(path)",

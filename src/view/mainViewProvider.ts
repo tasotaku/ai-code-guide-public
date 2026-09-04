@@ -4,7 +4,11 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawn } from "node:child_process";
 import { extractGraph, funcAtLine, extractProjectGraph, getStmtSpans, listFunctions, GraphNode, GraphEdge, FuncInfo, ProjectFileNode } from "../flowchart/astParser";
-import { snapBlocks, splitSingleBlockByTopLevelStatements } from "../api/blockRangeSnapper";
+import { isSupportedLanguage, languageProfile, SupportedLanguageId } from "../flowchart/languageSupport";
+import { MeaningRange } from "../api/blockRangeSnapper";
+import { SemanticBackgroundService } from "../api/semanticBackground";
+import { GenerationGate, GenerationTrigger } from "../api/generationGate";
+import { buildSemanticLineIndex, SEMANTIC_BACKGROUND_PALETTE } from "./semanticBackground";
 import { generateNodeLabels, generateBlockDescriptions, chatAboutCode, summarizeChatConclusion, answerHelpQuestion, generateModuleGroups, generateBlockBreakdown, generateFileDescriptions, generateDirDescriptions, generateFileOverview, generateProjectDiagram, refineSymbolDictionaryExplanation, ModuleGroup, BlockExpansion, BlockOverview, FileOverview, FileKind, getUsageStats, getDailyUsage, getAllTimeUsage } from "../api/claudeClient";
 import { PersistentCache, fnv1a } from "../flowchart/flowchartCache";
 import { buildMermaidCode, assignNodeColors, mermaidHead } from "../flowchart/mermaid";
@@ -19,7 +23,7 @@ import { findProjectAnchorLineInLines, findProjectSymbolLineInLines } from "./pr
 import type { AgentShowRequest, AgentShowResult, ProjectDiagramBridgeLink } from "./projectDiagramBridge";
 import { AnnotateResult, SemanticAnnotationProvider } from "../inline/blockExplanationProvider";
 import { SemanticAnnotation } from "../api/claudeClient";
-import { buildLineAnnotation, resolveAnnotations } from "../api/annotationResolver";
+import { resolveAnnotations } from "../api/annotationResolver";
 import { providerOf, effectiveModel } from "../api/llmProvider";
 import { findGitExcludeInfo } from "../util/gitExclude";
 import { getSecretKey, settingToProvider } from "../api/secretKeys";
@@ -48,6 +52,9 @@ interface TraceView {
     ): { funcName: string; loopId: number; headerLine: number; iter: number; max: number; depth: number }[];
 }
 
+type DefaultLayerState = { status: "idle" | "queued" | "generating" | "ready" | "stale" | "stopped" | "error"; completed: number; total: number; message?: string; retryable?: boolean };
+type DefaultLayers = { background: DefaultLayerState; inline: DefaultLayerState };
+
 export class MainViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = "aiCodeGuide.mainView";
 
@@ -67,6 +74,28 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     // 図(タブ)を隠しても残る＝#11「色は残してコード全幅」の土台。ノードごとに型を作り直す。
     private decorationTypes: vscode.TextEditorDecorationType[] = [];
     private coloringEnabled = true;
+    private readonly backgroundService: SemanticBackgroundService;
+    private readonly generationGate = new GenerationGate();
+    private backgroundNodes: GraphNode[] = [];
+    private readonly sourceParses = new Map<string, Promise<{ graph: Awaited<ReturnType<typeof extractGraph>>; funcs: FuncInfo[]; spans: Awaited<ReturnType<typeof getStmtSpans>> }>>();
+    private readonly layerStates = new Map<string, { source: string; layers: DefaultLayers }>();
+    private readonly layerJobs = new Map<string, { source: string; revision: number; automatic: boolean; task: Promise<void> }>();
+    private readonly saveReasons = new Map<string, vscode.TextDocumentSaveReason>();
+    private readonly expandedSources = new Map<string, string>();
+    private readonly staleExpansions = new Set<string>();
+    private readonly expansionTickets = new Map<string, symbol>();
+    private decorationIndexKey = "";
+    private decorationIndex: ReturnType<typeof buildSemanticLineIndex> = new Map();
+    private readonly layerStatus: vscode.StatusBarItem;
+    private layerRevision = 0;
+    private refreshedSource = "";
+
+    private colorBackgrounds(ranges: Record<string, MeaningRange[]>, nodes: GraphNode[]) {
+        // AI_NOTE: 未完了対象も含むAST所有順を色の基点にし、後着結果やトグルで既存色を回さない。
+        return Object.fromEntries(Object.entries(ranges).map(([id, blocks]) => [id, blocks.map((block, index) => ({
+            ...block, colorIndex: Math.max(0, nodes.findIndex(node => node.id === id)) + index,
+        }))]));
+    }
     // AI_NOTE: #14 ② 標準ビューの呼び出し関係の矢印 ON/OFF(#5: 矢印は邪魔なので既定OFF・幅も自動調整)。
     private arrowsEnabled = false;
     // AI_NOTE: 概要タブの呼び出し矢印 ON/OFF。畳んだグループはメイン(group-block)、開いたら関数(inner-card)を指す。
@@ -106,6 +135,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     private naturalMode = false;
     private naturalLabels: Record<string, string> | null = null;
     private naturalGenerating = false;
+    // AI_NOTE: 標準背景は詳細説明と別レイヤー。LLMが確定した意味区分を保持し、
+    // expandedDataが空でもVS Code/Codexのコード面へ常時適用する。
+    private meaningRanges: Record<string, MeaningRange[]> = {};
     // AI_NOTE: #14 カードの展開ブロック分解。nodeId→概要+サブブロック配列(表示中のもの)。旧パネルとexpand::キー共有。
     private expandedData: Record<string, BlockExpansion> = {};
     // AI_NOTE: #1 生成中のnodeId。これで「分解中…(生成中)」と「分解できませんでした(空結果)」を区別する。
@@ -295,7 +327,186 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
     // AI_NOTE: 外部AIには任意VS Codeコマンドを公開せず、理解支援6ビューだけを既存処理へ対応付ける。
     // ファイル検証はHTTP境界で済んでいるため、ここではVS Code表示状態の組み立てだけを担う。
+    // AI_NOTE: ASTの同内容要求は共有するが、ここではLLMを呼ばない。失敗を成功キャッシュに残さない。
+    private parseSource(source: string) {
+        const key = createHash("sha256").update(source).digest("hex");
+        const hit = this.sourceParses.get(key);
+        if (hit) return hit;
+        const task = Promise.all([
+            extractGraph(this.extensionPath, source), listFunctions(this.extensionPath, source), getStmtSpans(this.extensionPath, source),
+        ]).then(([graph, funcs, spans]) => {
+            if (graph.error) this.sourceParses.delete(key);
+            return { graph, funcs, spans };
+        }).catch((error) => { this.sourceParses.delete(key); throw error; });
+        this.sourceParses.set(key, task);
+        while (this.sourceParses.size > 32) this.sourceParses.delete(this.sourceParses.keys().next().value!);
+        return task;
+    }
+
+    // AI_NOTE: 課金状態をコード本文と別に示し、背景待ちでもコードを読めるようにする。
+    private publishLayerState(document: vscode.TextDocument): void {
+        this.layerRevision++;
+        if (this.currentDoc?.uri.toString() !== document.uri.toString()) return;
+        const state = this.layerStates.get(document.uri.toString());
+        if (!state) return;
+        const text = Object.entries(state.layers).map(([name, value]) =>
+            `${name === "background" ? "背景" : "名称"}: ${value.message ?? `${value.completed}/${value.total}`}`,
+        ).join(" / ");
+        this.layerStatus.text = `$(symbol-color) ${text}`;
+        this.layerStatus.tooltip = "解説を更新（未保存コードも対象）";
+        this.layerStatus.show();
+        if (document.getText() === this.refreshedSource) {
+            this.meaningRanges = this.colorBackgrounds(this.backgroundService.peek(document.uri.toString(), this.refreshedSource, this.backgroundNodes), this.backgroundNodes);
+            this.applyDecorations();
+        }
+    }
+
+    stopDefaultLayers(document: vscode.TextDocument): void {
+        // AI_NOTE: 未開始の要求と表示への適用を止める。送信済み課金の取消を成功扱いしない。
+        const uri = document.uri.toString();
+        this.generationGate.stop(uri);
+        const old = this.layerStates.get(uri)?.layers;
+        this.layerStates.set(uri, { source: document.getText(), layers: {
+            background: { ...(old?.background ?? { completed: 0, total: 0 }), status: "stopped", message: "停止中" },
+            inline: { ...(old?.inline ?? { completed: 0, total: 0 }), status: "stopped", message: "停止中" },
+        } });
+        this.publishLayerState(document);
+    }
+
+    async clearBackgroundCache(): Promise<void> {
+        // AI_NOTE: 利用者による消去で未送信の旧要求も失効。消した直後に勝手に再課金しない。
+        for (const uri of this.layerStates.keys()) this.generationGate.stop(uri);
+        this.backgroundService.clear();
+        this.meaningRanges = {};
+        this.expandedData = {};
+        this.staleExpansions.clear();
+        this.expansionTickets.clear();
+        this.expandGenerating.clear();
+        this.applyDecorations();
+        for (const state of this.layerStates.values()) {
+            state.layers.background = { status: "stopped", completed: 0, total: 0, message: "キャッシュ消去済み。解説を更新で再生成" };
+            if (["queued", "generating"].includes(state.layers.inline.status)) state.layers.inline = {
+                ...state.layers.inline, status: "stopped", message: "生成を停止しました",
+            };
+        }
+        if (this.currentDoc) this.publishLayerState(this.currentDoc);
+        if (this.view) this.view.webview.html = this.buildHtml();
+        await this.backgroundService.flush();
+    }
+
+    async prepareDefaultLayers(document: vscode.TextDocument, trigger: GenerationTrigger = "open", respectSettings = false, retryLayer?: keyof DefaultLayers): Promise<void> {
+        // AI_NOTE: 自動保存・入力停止はこの許可を発行しない。明示操作以外はdirtyと編集待ちを尊重する。
+        if (document.languageId !== "python") return;
+        const uri = document.uri.toString();
+        const saved = this.layerStates.get(uri);
+        // AI_NOTE: 再試行の許可は失敗した同一コードだけ。成功層や停止を暗黙に再開しない。
+        if (retryLayer && (saved?.source !== document.getText() || saved.layers[retryLayer].status !== "error")) return;
+        if (!this.generationGate.allow(uri, document.isDirty || document.isUntitled, trigger)) {
+            await this.annotationProvider.restoreCurrentDocument(document);
+            return;
+        }
+        const source = document.getText();
+        const previous = this.layerJobs.get(uri);
+        const revision = this.generationGate.revision(uri);
+        if (!retryLayer && previous?.source === source && previous.revision === revision) return previous.task;
+        const current = () => !document.isClosed && document.getText() === source
+            && this.generationGate.revision(uri) === revision && !this.generationGate.isStopped(uri);
+        const config = vscode.workspace.getConfiguration("aiCodeGuide", document.uri);
+        const backgroundEnabled = retryLayer ? retryLayer === "background" : (!respectSettings && trigger === "explicit") || config.get<boolean>("autoSemanticBackgrounds", true);
+        const inlineEnabled = retryLayer ? retryLayer === "inline" : (!respectSettings && trigger === "explicit") || config.get<boolean>("autoInlineAnnotations", true);
+        // AI_NOTE: 兄弟層の実行中closureと同じ状態を保持し、その後着完了を失わない。
+        const states: DefaultLayers = retryLayer ? saved!.layers : {
+            background: { status: backgroundEnabled ? "queued" : "idle", completed: 0, total: 0, message: backgroundEnabled ? "準備中" : "自動生成OFF" },
+            inline: { status: inlineEnabled ? "queued" : "idle", completed: 0, total: 0, message: inlineEnabled ? "準備中" : "自動生成OFF" },
+        };
+        if (retryLayer) states[retryLayer] = { ...states[retryLayer], status: "queued", message: "再試行を準備中" };
+        this.layerStates.set(uri, { source, layers: states });
+        this.publishLayerState(document);
+        const task = (async () => {
+            if (previous) await previous.task;
+            if (!current()) return;
+            if (vscode.window.activeTextEditor?.document.uri.toString() === uri) await this.refresh(document);
+            const { graph, spans } = await this.parseSource(source);
+            if (!current()) return;
+            if (graph.error) throw new Error(`構文を確認してください: ${graph.error}`);
+            const nodes = graph.backgroundNodes ?? graph.nodes;
+            const background = async () => {
+                if (!backgroundEnabled) return;
+                states.background = { status: "generating", completed: 0, total: nodes.length, message: "生成中" };
+                const result = await this.backgroundService.ensure(uri, source, nodes, spans, {
+                    isCurrent: current,
+                    onUpdate: (snapshot) => {
+                        if (!current()) return;
+                        states.background = { status: "generating", completed: snapshot.completed, total: snapshot.total, message: `生成中 ${snapshot.completed}/${snapshot.total}` };
+                        this.publishLayerState(document);
+                    },
+                });
+                if (!current()) return;
+                const errors = Object.values(result.errors);
+                states.background = { status: errors.length ? "error" : "ready", completed: result.completed, total: result.total,
+                    message: errors.length ? errors.join(" / ") : `完了 ${result.completed}/${result.total}` };
+                this.publishLayerState(document);
+            };
+            const inline = async () => {
+                if (!inlineEnabled) { if (!retryLayer) await this.annotationProvider.restoreCurrentDocument(document); return; }
+                states.inline = { status: "generating", completed: 0, total: 0, message: "生成中" };
+                this.publishLayerState(document);
+                const result = await this.annotationProvider.annotateDocument(document, undefined, undefined, false, { isCurrent: current });
+                if (!current()) return;
+                await this.annotationProvider.restoreCurrentDocument(document);
+                states.inline = { status: result.status === "empty" ? "error" : "ready", completed: result.count, total: result.count,
+                    message: result.status === "empty" ? "生成結果を確認してください" : `完了 ${result.count}件` };
+                this.publishLayerState(document);
+            };
+            await Promise.all([background().catch((error) => {
+                if (current()) { states.background = { ...states.background, status: "error", message: String(error.message ?? error) }; this.publishLayerState(document); }
+            }), inline().catch((error) => {
+                if (current()) { states.inline = { ...states.inline, status: "error", message: String(error.message ?? error) }; this.publishLayerState(document); }
+            })]);
+        })().catch((error) => {
+            if (!current()) return;
+            if (!retryLayer || retryLayer === "background") states.background = { ...states.background, status: "error", message: String(error.message ?? error) };
+            if (!retryLayer || retryLayer === "inline") states.inline = { ...states.inline, status: "error", message: "構文・生成設定を確認してください" };
+            this.publishLayerState(document);
+        });
+        this.layerJobs.set(uri, { source, revision, automatic: trigger !== "explicit", task });
+        await task;
+        if (this.layerJobs.get(uri)?.task === task) this.layerJobs.delete(uri);
+    }
+
+    // AI_NOTE: 全公開結果に同じ内容識別を付ける。非同期生成中の編集で異なるコードの結果を混ぜない。
     private async showAgentView(request: AgentShowRequest): Promise<AgentShowResult> {
+        const document = request.absoluteFile ? await vscode.workspace.openTextDocument(request.absoluteFile) : this.currentDoc;
+        const source = document?.getText();
+        const hash = source === undefined ? undefined : createHash("sha256").update(source).digest("hex");
+        if (request.expectedSourceSha256 && request.expectedSourceSha256 !== hash) throw new Error("Source changed; request a new view");
+        if (document && request.view === "standard") {
+            // AI_NOTE: 非同期再試行はここで失敗状態を検証し、HTTP応答後も拡張が所有する。
+            if (request.retryLayer) {
+                const state = this.layerStates.get(document.uri.toString());
+                if (!state || state.source !== source || state.layers[request.retryLayer].status !== "error") throw new Error("Layer is not retryable");
+                void this.prepareDefaultLayers(document, "explicit", true, request.retryLayer);
+            }
+            if (request.backgroundAction === "stop") this.stopDefaultLayers(document);
+            if (request.backgroundAction === "generate") void this.prepareDefaultLayers(document, "explicit", true);
+        }
+        const result = await this.buildAgentView(request);
+        if (document && document.getText() !== source) throw new Error("Source changed; request a new view");
+        if (request.view === "standard" && document) {
+            const inline = await this.buildAgentView({ view: "inline", absoluteFile: document.uri.fsPath, activate: false });
+            result.annotations = inline.annotations;
+            const state = this.layerStates.get(document.uri.toString());
+            if (state && state.source === source) result.layers = state.layers;
+            else result.layers = {
+                background: { status: "stale", completed: 0, total: 0, message: "保存後に更新" },
+                inline: { status: "stale", completed: 0, total: 0, message: "保存後に更新" },
+            };
+        }
+        if (document && document.getText() !== source) throw new Error("Source changed; request a new view");
+        return { ...result, sourceSha256: hash, revision: this.layerRevision };
+    }
+
+    private async buildAgentView(request: AgentShowRequest): Promise<AgentShowResult> {
         const tabByView = {
             standard: "standard",
             overview: "overview",
@@ -315,6 +526,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         let preparedDescriptions: Record<string, string> | null = null;
         let preparedFileOverview: FileOverview | null = null;
         let preparedCoarseGroups: ModuleGroup[] | null = null;
+        let preparedMeaningRanges: Record<string, MeaningRange[]> | null = null;
         let preparedExpandedData: Record<string, BlockExpansion> | null = null;
         let targetDocument: vscode.TextDocument | undefined;
         let inlineResult: AnnotateResult | undefined;
@@ -338,7 +550,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         if (request.absoluteFile) {
             const document = await vscode.workspace.openTextDocument(vscode.Uri.file(request.absoluteFile));
             targetDocument = document;
-            if (document.languageId !== "python") throw new Error("Python files only");
+            if (!isSupportedLanguage(document.languageId)) throw new Error("Supported code files only");
             const zeroBasedLine = Math.min((request.line ?? 1) - 1, Math.max(0, document.lineCount - 1));
             const position = new vscode.Position(zeroBasedLine, 0);
             const rangeStart = request.startLine === undefined
@@ -369,11 +581,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 // currentDoc/graphNodes/webviewを書き換えると、並列で最後に完了した背景要求が
                 // foregroundのエディタと標準タブを別ファイルへ分離してしまうため。
                 const source = document.getText();
-                const result = await extractGraph(this.extensionPath, source);
+                const { graph: result, spans: stmtSpans } = await this.parseSource(source);
                 preparedGraphNodes = result.error ? [] : result.nodes;
                 preparedGraphEdges = result.error ? [] : result.edges;
                 preparedGraphRelationships = result.error ? [] : (result.relationships ?? []);
                 const lines = source.split("\n");
+                preparedMeaningRanges = this.colorBackgrounds(this.backgroundService.peek(document.uri.toString(), source, result.backgroundNodes ?? preparedGraphNodes), result.backgroundNodes ?? preparedGraphNodes);
                 preparedDescriptions = {};
                 for (const node of preparedGraphNodes) {
                     const cached = this.llmCache.get<string>(this.nodeDescKey(node, lines));
@@ -383,8 +596,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 preparedCoarseGroups = this.llmCache.get<ModuleGroup[]>(this.coarseKey(source)) ?? null;
                 if (request.view === "standard" && request.expandLines !== undefined) {
                     preparedExpandedData = await this.prepareStandardExpansions(
-                        document, preparedGraphNodes, request.expandLines
+                        document, result.backgroundNodes ?? preparedGraphNodes, request.expandLines
                     );
+                    preparedMeaningRanges = this.colorBackgrounds(this.backgroundService.peek(document.uri.toString(), source, result.backgroundNodes ?? preparedGraphNodes), result.backgroundNodes ?? preparedGraphNodes);
                 }
             } else if (backgroundDocumentRequest && request.view === "trace") {
                 const result = await extractGraph(this.extensionPath, document.getText());
@@ -439,13 +653,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 ? vscode.window.visibleTextEditors.find((item) => item.document.uri.toString() === document.uri.toString())
                 : undefined;
             if (!document) throw new Error("Inline explanations require a file");
-            // AI_NOTE: activate=true は利用者がインライン表示を求めた操作。右余白を共有するトレースを先に解除し、
-            // 保存済み注釈を復元してから生成/表示する。activate=false の背景取得では画面状態を変えない。
-            if (activate && editor && this.traceProvider?.isActive(editor.document.uri.toString())) {
-                this.traceProvider.clear(editor);
-                this.annotationProvider.restoreFromCache(editor);
-                this.refreshTraceStatus();
-            }
             const removeIds = request.removeAnnotationIds ?? [];
             const hideIds = request.hideAnnotationIds ?? [];
             const revisionIds = [...removeIds, ...hideIds];
@@ -499,6 +706,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 traceRun = await vscode.commands.executeCommand("aiCodeGuide.traceFunctions", {
                     uri: targetDocument.uri.toString(),
                     background: !activate,
+                    ...(request.expectedSourceSha256 ? { expectedSourceSha256: request.expectedSourceSha256 } : {}),
                     ...(request.functions === undefined ? {} : { funcs: request.functions }),
                     ...(request.line === undefined ? {} : { line: request.line }),
                     ...(request.arguments === undefined ? {} : { arguments: request.arguments, force: true }),
@@ -585,6 +793,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             const standardNodes = preparedGraphNodes ?? this.graphNodes;
             const standardDescriptions = preparedDescriptions ?? this.descMap;
             const standardOverview = preparedGraphNodes === null ? this.fileOverview : preparedFileOverview;
+            const standardMeaningRanges = preparedMeaningRanges ?? this.meaningRanges;
             // AI_NOTE: Codexの標準WebviewでもVS Codeと同じ意味単位を色で対応づけるため、トップレベルの
             // 関数・クラス色と、子メソッドが継承する親クラス色を表示データとして返す。
             const standardColors = assignNodeColors(standardNodes, new Set(["function", "class"]), true);
@@ -597,6 +806,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             const standardView: NonNullable<AgentShowResult["standard"]> = {
                 title: path.basename(request.absoluteFile),
                 file: relativeFile.split(path.sep).join("/"),
+                backgroundRanges: Object.values(standardMeaningRanges).flat().map((range) => ({
+                    ...range, lineStart: range.lineStart + 1, lineEnd: range.lineEnd + 1,
+                })),
                 ...(standardOverview?.role ? { role: standardOverview.role } : {}),
                 source: Array.from({ length: standardLineCount }, (_, index) => ({
                     line: index + 1,
@@ -610,7 +822,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                             ? standardColors.get(standardNodesById.get(node.parent)?.id ?? "")?.color
                             : undefined;
                         const color = standardColors.get(node.id)?.color ?? parentColor;
-                        const expansion = preparedExpandedData?.[node.id] ?? this.expandedData[node.id];
+                        // AI_NOTE: activate:falseの初期Codex標準表示へ、別表示中の展開状態をID一致だけで
+                        // 混ぜない。明示expandLinesがある要求だけpreparedExpandedDataを公開する。
+                        const expansion = preparedGraphNodes !== null
+                            ? preparedExpandedData?.[node.id]
+                            : this.expandedData[node.id];
                         // AI_NOTE: 拡張内部はVS Codeの0始まり座標を保持している。MCP公開境界では
                         // コード全文・定義位置と同じ1始まりに揃え、App側の色範囲を1行ずらさない。
                         const publicExpansion = expansion ? {
@@ -629,6 +845,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                             lineEnd: node.lineEnd + 1,
                             ...(node.parent ? { parent: node.parent } : {}),
                             ...(color ? { color } : {}),
+                            ...(standardMeaningRanges[node.id]?.length ? {
+                                meaningRanges: standardMeaningRanges[node.id].map((range) => ({
+                                    ...range,
+                                    lineStart: range.lineStart + 1,
+                                    lineEnd: range.lineEnd + 1,
+                                })),
+                            } : {}),
                             ...(standardDescriptions[node.id] ? { description: standardDescriptions[node.id] } : {}),
                             ...(publicExpansion ? { expanded: true, expansion: publicExpansion } : {}),
                         };
@@ -793,7 +1016,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                         return {
                             id: item.id,
                             kind: item.kind,
-                            severity: item.severity,
                             label: item.label,
                             explanation: item.explanation,
                             startLine: item.startLine + 1,
@@ -945,32 +1167,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             return node ? [node] : [];
         }).filter((node, index, all) => all.findIndex((candidate) => candidate.id === node.id) === index);
         const result: Record<string, BlockExpansion> = {};
-        const stmtSpans = await getStmtSpans(this.extensionPath, source);
-        const sourceLines = source.split("\n");
+        const { spans: stmtSpans } = await this.parseSource(source);
         for (const node of targets) {
-            const cached = this.llmCache.get<BlockExpansion>(this.expandKey(node.id, source));
-            if (cached) {
-                result[node.id] = cached;
-                continue;
-            }
-            const kind = node.kind === "class" ? "class" : node.kind === "function" ? "function" : "block";
-            const generated = await generateBlockBreakdown(
-                node.label || node.id,
-                sourceLines.slice(node.lineStart, node.lineEnd + 1),
-                node.lineStart,
-                kind,
-            );
-            const snappedBlocks = stmtSpans.length > 0
-                ? snapBlocks(generated.blocks, stmtSpans, node.lineStart, node.lineEnd)
-                : generated.blocks;
-            const blocks = splitSingleBlockByTopLevelStatements(
-                snappedBlocks, stmtSpans, node.lineStart, node.lineEnd, sourceLines,
-            );
-            const expansion = { overview: generated.overview, blocks };
-            result[node.id] = expansion;
-            if (blocks.length > 0 || expansion.overview !== null) {
-                this.llmCache.set(this.expandKey(node.id, source), expansion);
-            }
+            // AI_NOTE: 背景の区切りを固定して説明だけ追加。閉じた対象や他関数の詳細は生成しない。
+            result[node.id] = await this.backgroundService.details(document.uri.toString(), source, graphNodes, stmtSpans, node.id,
+                () => document.getText() === source);
         }
         return result;
     }
@@ -993,7 +1194,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     async revealCurrentStandardCard(): Promise<void> {
         const editor = this.getCurrentEditor() ?? vscode.window.activeTextEditor;
         if (!editor || editor.document !== this.currentDoc) {
-            vscode.window.showInformationMessage("AI Code Guide: 表示中のPythonファイルで、移動したい場所にカーソルを置いてください。");
+            vscode.window.showInformationMessage("AI Code Guide: 表示中の対応コードで、移動したい場所にカーソルを置いてください。");
             return;
         }
         const line = editor.selection.active.line;
@@ -1059,6 +1260,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     constructor(context: vscode.ExtensionContext, annotationProvider: SemanticAnnotationProvider, chatLinkStore: ChatLinkStore) {
         this.extensionPath = context.extensionPath;
         this.globalStoragePath = context.globalStorageUri.fsPath;
+        this.backgroundService = new SemanticBackgroundService(this.globalStoragePath);
+        this.layerStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 20);
+        this.layerStatus.command = "aiCodeGuide.updateDefaultLayers";
+        context.subscriptions.push(this.layerStatus, { dispose: () => { void this.backgroundService.flush(); } });
         this.projectDiagramBridge = new ProjectDiagramBridge({
             getWorkspaceRoot: () => this.projectRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
             getManifestPath: () => {
@@ -1081,6 +1286,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 const root = this.projectRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
                 if (!root) throw new Error("Workspace unavailable");
                 const document = await vscode.workspace.openTextDocument(path.resolve(root, args.file));
+                if (args.expectedSourceSha256 && createHash("sha256").update(document.getText()).digest("hex") !== args.expectedSourceSha256) {
+                    throw new Error("Source changed; request a new view");
+                }
                 return refineSymbolDictionaryExplanation({
                     code: document.getText(),
                     display: args.display,
@@ -1090,10 +1298,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                     history: args.history,
                 });
             },
-            updateSymbolExplanation: async (file, symbolKey, explanation) => {
+            updateSymbolExplanation: async (file, symbolKey, explanation, expectedSourceSha256) => {
                 const root = this.projectRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
                 if (!root) throw new Error("Workspace unavailable");
                 const document = await vscode.workspace.openTextDocument(path.resolve(root, file));
+                if (expectedSourceSha256 && createHash("sha256").update(document.getText()).digest("hex") !== expectedSourceSha256) {
+                    throw new Error("Source changed; request a new view");
+                }
                 if (this.annotationProvider.updateSymbolExplanationForDocument(document, symbolKey, explanation) === 0) {
                     throw new Error("更新対象の名称が見つかりませんでした。");
                 }
@@ -1113,18 +1324,48 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         // AI_NOTE: 拡張の生存期間ずっと購読する。アクティブPythonに追従してサイドバーを更新する
         context.subscriptions.push(
             vscode.window.onDidChangeActiveTextEditor((e) => {
+                const activeUri = e?.document.uri.toString();
+                for (const [uri, job] of this.layerJobs) {
+                    if (job.automatic && uri !== activeUri && job.revision === this.generationGate.revision(uri)) {
+                        // AI_NOTE: 別ファイルへ移ったら未送信だけ休止。停止ボタンとは異なり、戻った時は不足分を再開できる。
+                        this.generationGate.pause(uri);
+                        const state = this.layerStates.get(uri);
+                        if (state) for (const layer of Object.values(state.layers)) {
+                            if (layer.status === "queued" || layer.status === "generating") {
+                                layer.status = "idle"; layer.message = "別ファイルへ移動したため休止中";
+                            }
+                        }
+                    }
+                }
                 if (!this.suppressActiveEditorRefresh) void this.refresh(e?.document);
             }),
+            vscode.workspace.onWillSaveTextDocument((event) => {
+                this.saveReasons.set(event.document.uri.toString(), event.reason);
+            }),
             vscode.workspace.onDidSaveTextDocument((doc) => {
-                // AI_NOTE: URI比較。currentDoc は別インスタンスを指していることがある(getCurrentEditor 参照)
-                if (this.currentDoc && doc.uri.toString() === this.currentDoc.uri.toString()) this.refresh(doc);
+                // AI_NOTE: 手動保存の通知だけが課金許可。自動保存・focus移動保存は表示更新に留める。
+                const uri = doc.uri.toString();
+                const reason = this.saveReasons.get(uri);
+                this.saveReasons.delete(uri);
+                if (this.currentDoc?.uri.toString() === uri) void this.refresh(doc);
+                if (reason === vscode.TextDocumentSaveReason.Manual) void this.prepareDefaultLayers(doc, "save");
             }),
             // AI_NOTE: 保存を待たず、編集中(手入力/Claude Codeの外部書き込み)にもフローチャートを追従させる。
             // 表示中の currentDoc かつ Python のときだけ、入力が止まってから(500ms デバウンス)refresh する。
             // refresh は AST パースのみでLLMは叩かない(説明はキャッシュ読取)ためトークンコストは無い。
             vscode.workspace.onDidChangeTextDocument((e) => {
-                if (!this.currentDoc || e.document.uri.toString() !== this.currentDoc.uri.toString()) return;
-                if (e.document.languageId !== "python") return;
+                if (e.document.languageId !== "python" || !e.contentChanges.length) return;
+                const uri = e.document.uri.toString();
+                this.generationGate.edit(uri);
+                if (!this.currentDoc || uri !== this.currentDoc.uri.toString()) return;
+                this.meaningRanges = {};
+                this.applyDecorations();
+                for (const id of Object.keys(this.expandedData)) this.staleExpansions.add(id);
+                this.layerStates.set(uri, { source: e.document.getText(), layers: {
+                    background: { status: "stale", completed: 0, total: 0, message: "保存後に更新" },
+                    inline: { status: "stale", completed: 0, total: 0, message: "保存後に更新" },
+                } });
+                this.publishLayerState(e.document);
                 if (this.refreshDebounce) clearTimeout(this.refreshDebounce);
                 this.refreshDebounce = setTimeout(() => this.refresh(e.document), 500);
             }),
@@ -1141,7 +1382,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 // AI_NOTE: 非空のPython選択を「引用候補」として覚え、コードだけwebviewへ送る。
                 // webview はチャット欄への貼り付けがこのコードと一致したらチップ化する（貼り付け=引用のCursor風導線）。
                 const sel = e.selections[0];
-                if (!sel.isEmpty && e.textEditor.document.languageId === "python") {
+                if (!sel.isEmpty && isSupportedLanguage(e.textEditor.document.languageId)) {
                     const code = e.textEditor.document.getText(sel);
                     this.lastQuoteCandidate = {
                         code,
@@ -1155,6 +1396,19 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             }),
             // AI_NOTE: #12 設定が(設定タブ/標準設定UIどちらで)変わってもUIを最新値に追従させる
             vscode.workspace.onDidChangeConfiguration((e) => {
+                const generationSettingChanged = ["globalContext", "model", "inlineAnnotationModel", "useSubscription", "subscriptionProvider", "autoSemanticBackgrounds", "autoInlineAnnotations"]
+                    .some(key => e.affectsConfiguration(`aiCodeGuide.${key}`));
+                if (generationSettingChanged) {
+                    for (const uri of this.layerStates.keys()) this.generationGate.edit(uri);
+                    for (const state of this.layerStates.values()) for (const layer of Object.values(state.layers)) {
+                        layer.status = "stale"; layer.message = "設定変更後の更新待ち";
+                    }
+                    if (this.currentDoc) {
+                        for (const id of Object.keys(this.expandedData)) this.staleExpansions.add(id);
+                        void this.annotationProvider.restoreCurrentDocument(this.currentDoc);
+                        this.publishLayerState(this.currentDoc);
+                    }
+                }
                 if (e.affectsConfiguration("aiCodeGuide") && this.view) this.view.webview.html = this.buildHtml();
             }),
             // AI_NOTE: インライン解説の生成/クリアで件数バッジだけを更新する。
@@ -1164,13 +1418,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 const editor = this.getCurrentEditor();
                 const items = editor ? this.annotationProvider.getAnnotations(editor).items : [];
                 const time = editor ? this.annotationProvider.getAnnotations(editor).generatedAt : null;
-                const warn = items.filter((a) => a.severity === "warning").length;
                 this.view.webview.postMessage({
-                    type: "annCount", count: items.length, warn, info: items.length - warn,
+                    type: "annCount", count: items.length,
                     time: time ? time.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }) : "",
                 });
             }),
-            { dispose: () => this.disposeDecorations() }
+            { dispose: () => { if (this.refreshDebounce) clearTimeout(this.refreshDebounce); this.disposeDecorations(); } }
         );
     }
 
@@ -1205,6 +1458,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             } else if (msg.type === "toggleOverviewArrows") {
                 this.overviewArrows = !this.overviewArrows;
                 if (this.view) this.view.webview.html = this.buildHtml();
+            } else if (msg.type === "updateDefaultLayers") {
+                if (this.currentDoc) void this.prepareDefaultLayers(this.currentDoc, "explicit");
+            } else if (msg.type === "stopDefaultLayers") {
+                if (this.currentDoc) this.stopDefaultLayers(this.currentDoc);
             } else if (msg.type === "toggleColoring") {
                 this.coloringEnabled = !this.coloringEnabled;
                 this.applyDecorations();
@@ -1396,24 +1653,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 // regen=キャッシュ無視で full を作り直す(range 注釈は provider 側で吸収して残る)。
                 const force = msg.type === "annotateRegen";
                 const editor = this.getCurrentEditor() ?? vscode.window.activeTextEditor;
-                if (!editor || editor.document.languageId !== "python") {
-                    vscode.window.showWarningMessage("AI Code Guide: Pythonファイルを開いてください。");
+                if (!editor || !isSupportedLanguage(editor.document.languageId)) {
+                    vscode.window.showWarningMessage("AI Code Guide: Python・JavaScript・TypeScriptファイルを開いてください。");
                 } else {
                     this.runAnnotate(force ? "regen" : "run", () => this.annotationProvider.annotateFile(editor, force));
-                }
-            } else if (msg.type === "annotateDiffToggle") {
-                // AI_NOTE: diffモードの ON/OFF トグル。ONなら変更行のみ表示、OFFで全件へ戻す。
-                // ON時は git差分→生成があるので runAnnotate(スピナー)で回し、OFFは即時。
-                const editor = this.getCurrentEditor() ?? vscode.window.activeTextEditor;
-                if (!editor || editor.document.languageId !== "python") {
-                    vscode.window.showWarningMessage("AI Code Guide: Pythonファイルを開いてください。");
-                } else if (this.annotationProvider.isDiffMode(editor.document.uri.toString())) {
-                    this.annotationProvider.exitDiffMode(editor);
-                    this.refresh(this.activePythonDoc());
-                } else {
-                    // AI_NOTE: runAnnotate は内部で例外を捉えるので await して、完了後にパネルを更新しボタンをON表示にする。
-                    await this.runAnnotate("diff", () => this.annotationProvider.annotateDiff(editor));
-                    this.refresh(this.activePythonDoc());
                 }
             } else if (msg.type === "annotateClear") {
                 vscode.commands.executeCommand("aiCodeGuide.clearBlockExplanations");
@@ -1451,60 +1694,28 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 //   ・既に範囲選択がある → そのまま解析
                 //   ・未選択 → 選択待ちモードへ。エディタにフォーカスを移してドラッグ選択を誘導する
                 this.handleAnnotateSelectionClick().catch((e) => console.error("[AI Code Guide] annotateSelection failed:", e));
-            } else if (msg.type === "setDensity" && typeof msg.text === "string") {
-                // AI_NOTE: 密度切替は設定だけ変えて再生成しない(トークン消費を避けるため)。次回生成からの反映を1度だけトーストで知らせる
-                vscode.workspace.getConfiguration("aiCodeGuide").update("inlineAnnotationDensity", msg.text, vscode.ConfigurationTarget.Global);
-                vscode.window.showInformationMessage(`AI Code Guide: 解説密度を「${msg.text}」に変更しました。次回の生成から反映されます。`);
             } else if (msg.type === "toggleAutoAnnotate") {
                 const cfg = vscode.workspace.getConfiguration("aiCodeGuide");
-                const cur = cfg.get<boolean>("autoInlineAnnotations", false);
+                const cur = cfg.get<boolean>("autoInlineAnnotations", true);
                 cfg.update("autoInlineAnnotations", !cur, vscode.ConfigurationTarget.Global);
-            } else if (msg.type === "setSymbolPlacement") {
-                // AI_NOTE: 下線解説の置き場所(below/right/hover)。3値enumになったので反転トグルでなく押された値をそのまま採る。
-                // 設定更新を待ってから表示中エディタを描き直す(config.updateは非同期)。onDidChangeConfiguration側でも
-                // refreshVisibilityは走るが、パネルの選択状態を即合わせるため refresh も明示で呼ぶ。
+            } else if (msg.type === "toggleShowAnnotations") {
+                // AI_NOTE: 名称Hoverの表示だけを切り替える。再生成はしない。
                 const cfg = vscode.workspace.getConfiguration("aiCodeGuide");
-                const next = msg.text === "right" || msg.text === "hover" ? msg.text : "below";
-                await cfg.update("symbolAnnotationPlacement", next, vscode.ConfigurationTarget.Global);
+                const cur = cfg.get<boolean>("showAnnotations", true);
+                await cfg.update("showAnnotations", !cur, vscode.ConfigurationTarget.Global);
                 const editor = this.getCurrentEditor();
                 if (editor) this.annotationProvider.refreshVisibility(editor);
-                this.refresh(this.activePythonDoc());
-            } else if (
-                msg.type === "toggleHideResolved" || msg.type === "toggleWarningsOnly" ||
-                msg.type === "toggleShowAnnotations" || msg.type === "toggleShowHidden" ||
-                msg.type === "toggleStatusButtons" ||
-                msg.type === "toggleShowSymbols" || msg.type === "toggleShowBlocks"
-            ) {
-                // AI_NOTE: 表示モードのトグル(解決済みを隠す/警告のみ/③下線ON-OFF/③隠した注釈も表示/状態ボタン/④下線だけ/④枠だけ)。
-                // 設定を反転し、表示中エディタを再生成せず再フィルタする。config 更新は非同期なので反転後の値を読めるよう待つ。
-                const cfgKeyMap: Record<string, string> = {
-                    toggleHideResolved: "hideResolvedAnnotations",
-                    toggleWarningsOnly: "warningsOnly",
-                    toggleShowAnnotations: "showAnnotations",
-                    toggleShowHidden: "showHiddenAnnotations",
-                    toggleStatusButtons: "showAnnotationStatusButtons",
-                    toggleShowSymbols: "showSymbolAnnotations",
-                    toggleShowBlocks: "showBlockAnnotations",
-                };
-                const cfgKey = cfgKeyMap[msg.type];
-                const cfg = vscode.workspace.getConfiguration("aiCodeGuide");
-                // AI_NOTE: 既定true(hideResolved/showAnnotations/④粒度別)と既定falseが混在。既定値を合わせないと初回トグルが効かない。
-                const trueDefaults = ["hideResolvedAnnotations", "showAnnotations", "showSymbolAnnotations", "showBlockAnnotations"];
-                const cur = cfg.get<boolean>(cfgKey, trueDefaults.includes(cfgKey));
-                await cfg.update(cfgKey, !cur, vscode.ConfigurationTarget.Global);
-                const editor = this.getCurrentEditor();
-                if (editor) this.annotationProvider.refreshVisibility(editor);
-                this.refresh(this.activePythonDoc());
+                this.refresh(this.activeCodeDoc());
             }
         });
         // AI_NOTE: ビューが(再)表示されたら現在のPythonに追従して描き直す。
         // アクティブエディタが既に開いている場合 onDidChangeActiveTextEditor は発火しないため、
         // 可視化のたびに自前で拾い直す(アクティベーション競合対策)。
         webviewView.onDidChangeVisibility(() => {
-            if (webviewView.visible) this.refresh(this.activePythonDoc());
+            if (webviewView.visible) this.refresh(this.activeCodeDoc());
         });
         // 初回表示: activeTextEditor が未確定でも visibleTextEditors から Python を拾う
-        this.refresh(this.activePythonDoc());
+        this.refresh(this.activeCodeDoc());
     }
 
     // AI_NOTE: currentDoc に対応する可視 TextEditor を返す。比較は uri 文字列で行う:
@@ -1523,17 +1734,16 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         if (this.view) this.view.webview.html = this.buildHtml();
     }
 
-    // AI_NOTE: 解析対象のPython文書を決める。activeが無い/非Pythonなら可視エディタから探す
-    private activePythonDoc(): vscode.TextDocument | undefined {
+    // AI_NOTE: 解析対象の対応言語文書を決める。activeが対象外なら可視エディタから探す。
+    private activeCodeDoc(): vscode.TextDocument | undefined {
         const active = vscode.window.activeTextEditor?.document;
-        if (active?.languageId === "python") return active;
-        return vscode.window.visibleTextEditors.find((e) => e.document.languageId === "python")?.document;
+        if (isSupportedLanguage(active?.languageId)) return active;
+        return vscode.window.visibleTextEditors.find((e) => isSupportedLanguage(e.document.languageId))?.document;
     }
 
     // AI_NOTE: アクティブなPythonファイルを解析してカード一覧を描き直す。
-    // Pythonでない/解析失敗時はその旨を表示する。サイドバーが未解決(this.view無し)なら何もしない。
+    // サイドバーが閉じていてもエディタ背景の座標とキャッシュを更新する。
     private async refresh(doc?: vscode.TextDocument): Promise<void> {
-        if (!this.view) return;
         if (doc && doc.languageId === "python") {
             // AI_NOTE: 別ファイルに切り替わったら表示中チャットと単一関数ドリルインをリセット(セッション自体はChatStoreに残る)
             if (this.currentDoc !== doc) {
@@ -1541,19 +1751,28 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
                 this.targetFunc = "";
                 this.funcGraph = null;
                 this.resetNaturalLabels();
+                this.meaningRanges = {};
                 this.expandedData = {};
+                this.expandedSources.clear();
+                this.staleExpansions.clear();
             }
             this.currentDoc = doc;
             const source = doc.getText();
             // AI_NOTE: トレースタブの関数チェックリスト用の一覧も同時に取り直す(グラフ解析と並列で待ち時間を増やさない)。
-            const [result, funcs] = await Promise.all([
-                extractGraph(this.extensionPath, source),
-                listFunctions(this.extensionPath, source),
-            ]);
+            const { graph: result, funcs } = await this.parseSource(source);
+            if (this.currentDoc?.uri.toString() !== doc.uri.toString() || doc.getText() !== source) return;
+            this.refreshedSource = source;
             this.traceFuncs = funcs;
             this.graphNodes = result.error ? [] : result.nodes;
             this.graphEdges = result.error ? [] : result.edges;
             this.graphRelationships = result.error ? [] : (result.relationships ?? []);
+            this.backgroundNodes = result.error ? [] : (result.backgroundNodes ?? result.nodes);
+            this.meaningRanges = this.colorBackgrounds(this.backgroundService.peek(doc.uri.toString(), source, this.backgroundNodes), this.backgroundNodes);
+            for (const id of Object.keys(this.expandedData)) {
+                const cached = this.backgroundService.peekDetails(doc.uri.toString(), source, this.backgroundNodes, id);
+                if (cached) { this.expandedData[id] = cached; this.staleExpansions.delete(id); }
+                else this.staleExpansions.add(id);
+            }
             // AI_NOTE: 標準ビューはトップレベルの構造(クラス/関数)だけ色を回す。import/実行/その他ブロックは
             // 色を持たせずグレー化(buildCardHtmlのfallback)。連結グループでメソッドはクラス色に塗るので個別色は不要。
             this.nodeColors = assignNodeColors(this.graphNodes, new Set(["function", "class"]), true);
@@ -1567,12 +1786,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
             }
             this.fileOverview = this.llmCache.get<FileOverview>(this.fileOverviewKey()) ?? null;
             this.coarseGroups = this.llmCache.get<ModuleGroup[]>(this.coarseKey(source)) ?? null;
-            this.view.webview.html = this.buildHtml(result.error);
+            if (this.view) this.view.webview.html = this.buildHtml(result.error);
             this.applyDecorations();
             return;
         }
         // 非Python or エディタ無し: ノードは保持したまま(直近ファイル)再描画
-        this.view.webview.html = this.buildHtml();
+        if (this.view) this.view.webview.html = this.buildHtml();
     }
 
     // AI_NOTE: カードクリックで対応コードへジャンプ。currentDoc を表示しているエディタを探して選択・スクロール
@@ -1591,12 +1810,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     private async drillIntoLine(line: number): Promise<void> {
         if (!this.currentDoc || !this.view) return;
         const source = this.currentDoc.getText();
-        const funcName = await funcAtLine(this.extensionPath, source, line);
+        const languageId = this.currentDoc.languageId as SupportedLanguageId;
+        const funcName = await funcAtLine(this.extensionPath, source, line, languageId);
         if (!funcName) {
             this.jumpToLine(line, line);
             return;
         }
-        const result = await extractGraph(this.extensionPath, source, funcName);
+        const result = await extractGraph(this.extensionPath, source, funcName, languageId);
         if (result.error || result.nodes.length === 0) {
             this.jumpToLine(line, line);
             return;
@@ -1670,40 +1890,29 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     // AI_NOTE: graphNodes をエディタ背景色として塗る。kind別の淡い色。coloringEnabled=false なら全消し。
     // ノードごとに型を作り直して行範囲に適用する(旧FlowchartPanelと同方式)。
     private applyDecorations(): void {
-        this.disposeDecorations();
-        const editor = this.getCurrentEditor();
-        if (!editor || !this.coloringEnabled) return;
-        // AI_NOTE: 展開中ノードは親色を塗らずサブブロック色だけにする。親(0.15)とサブ(0.15)を重ねると
-        // 二重塗りで展開前より濃く見えるため、展開時は親をスキップして濃さを展開前と揃える。
-        for (const n of this.graphNodes) {
-            if (this.expandedData[n.id]) continue;
-            // AI_NOTE: メソッド/ネストクラス(parent持ち)は塗らない。親クラスが本体全体を同色で塗るので、
-            // ここで重ねると二重塗りでその行だけ濃くなる(クラス色=メソッド色は連結で同じ)。
-            if (n.parent) continue;
-            const type = vscode.window.createTextEditorDecorationType({
-                backgroundColor: this.nodeColors.get(n.id)?.bg ?? bgFor(n.kind),
-                isWholeLine: true,
-            });
-            this.decorationTypes.push(type);
-            editor.setDecorations(type, [
-                new vscode.Range(new vscode.Position(n.lineStart, 0), new vscode.Position(n.lineEnd, 0)),
-            ]);
+        // AI_NOTE: LLMで確定した背景だけを共通パレットで塗る。未生成時に定義色へ代替しない。
+        if (!this.decorationTypes.length) {
+            this.decorationTypes = SEMANTIC_BACKGROUND_PALETTE.map((color) => vscode.window.createTextEditorDecorationType({
+                backgroundColor: hexToRgba(color, 0.15), isWholeLine: true,
+            }));
         }
-        // AI_NOTE: ▼展開中のノードはサブブロック色で塗る。subcardの左罫(--saccent)と同じSUB_PALETTE・
-        // 同じ並び順・親と同じ0.15で塗り、トグルの中身の色と濃さをコード背景に一致させる。
-        for (const n of this.graphNodes) {
-            const subs = this.expandedData[n.id]?.blocks;
-            if (!subs) continue;
-            subs.forEach((b, i) => {
-                const type = vscode.window.createTextEditorDecorationType({
-                    backgroundColor: hexToRgba(SUB_PALETTE[i % SUB_PALETTE.length], 0.15),
-                    isWholeLine: true,
-                });
-                this.decorationTypes.push(type);
-                editor.setDecorations(type, [
-                    new vscode.Range(new vscode.Position(b.lineStart, 0), new vscode.Position(b.lineEnd, 0)),
-                ]);
-            });
+        const ranges = this.coloringEnabled ? Object.values(this.meaningRanges).flat().map((range) => ({
+            ...range, lineStart: range.lineStart + 1, lineEnd: range.lineEnd + 1,
+        })) : [];
+        const key = JSON.stringify(ranges);
+        if (this.decorationIndexKey !== key) {
+            this.decorationIndexKey = key;
+            this.decorationIndex = buildSemanticLineIndex(ranges);
+        }
+        const index = this.decorationIndex;
+        const grouped = SEMANTIC_BACKGROUND_PALETTE.map(() => [] as vscode.Range[]);
+        for (const [line, unit] of index) {
+            const palette = SEMANTIC_BACKGROUND_PALETTE.findIndex(color => color === unit.color);
+            if (palette >= 0) grouped[palette].push(new vscode.Range(line - 1, 0, line - 1, 0));
+        }
+        for (const editor of vscode.window.visibleTextEditors) {
+            const current = editor.document.uri.toString() === this.currentDoc?.uri.toString();
+            this.decorationTypes.forEach((type, slot) => editor.setDecorations(type, current ? grouped[slot] : []));
         }
     }
 
@@ -1746,7 +1955,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     // 保存済みなら即returnし、表示ツールと生成ツールのコスト境界を崩さない。
     private async ensureFileOverview(): Promise<void> {
         if (this.fileOverview || !this.currentDoc) return;
-        const filename = path.basename(this.currentDoc.uri.fsPath || this.currentDoc.uri.path) || "file.py";
+        const filename = path.basename(this.currentDoc.uri.fsPath || this.currentDoc.uri.path) || "code-file";
         const overview = await generateFileOverview(
             filename,
             this.graphNodes.map((node) => ({ label: node.label, kind: node.kind })),
@@ -1838,7 +2047,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         if (error) {
             standardBody = `<div class="msg">解析に失敗しました:\n${escapeHtml(error)}</div>`;
         } else if (!this.currentDoc) {
-            standardBody = `<div class="msg">Pythonファイルを開くと構造を表示します</div>`;
+            standardBody = `<div class="msg">Python・JavaScript・TypeScriptファイルを開くと構造を表示します</div>`;
         } else if (drilled) {
             standardBody = this.buildFuncFlowchart();
         } else {
@@ -2301,10 +2510,15 @@ ${mermaid}
   /* AI_NOTE: チャットペイン上部のインライン解説パネル(生成/範囲/クリア/密度/自動 + 件数 + 一覧) */
   .ann-panel { flex-shrink: 0; border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2)); padding-bottom: 6px; margin-bottom: 6px; display: flex; flex-direction: column; gap: 4px; }
   .ann-rows { display: flex; flex-direction: column; gap: 4px; }
+  /* 初期viewportに通常生成と強制再生成を必ず並べる。説明文を各ボタンの横へ置くと、
+     狭いサイドバーで折り返して1行目だけが高さを占有し、再生成が画面外へ落ちる。 */
+  .ann-primary-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; }
+  .ann-primary-actions > .tbtn { min-width: 0; width: 100%; padding-left: 5px; padding-right: 5px; text-align: center; }
+  .ann-primary-desc { font-size: 10px; line-height: 1.35; color: var(--vscode-descriptionForeground); }
   .ann-row { display: flex; align-items: center; gap: 8px; }
   /* AI_NOTE: ボタン列は固定幅で説明の開始位置を縦に整列(ON↔OFFで幅が変わっても説明が動かない)。
      width指定はグローバル select{width:100%}(設定タブ用)の打ち消しも兼ねる */
-  .ann-row > .tbtn, .ann-row > .ann-density, .ann-row > .ann-seg { flex-shrink: 0; width: 150px; text-align: left; }
+  .ann-row > .tbtn { flex-shrink: 0; width: 150px; text-align: left; }
   .ann-desc { font-size: 11px; color: var(--vscode-descriptionForeground); flex: 1; min-width: 0; }
   /* AI_NOTE: トレースタブは操作名(ボタン・キー)が短いので左列を狭くする。解説タブと同じ150pxだと
      説明文が右半分へ押し込まれて何行にも折り返る(ユーザー指摘)。幅は最長ラベル「別の入力例で再実行」が
@@ -2332,14 +2546,6 @@ ${mermaid}
   .trace-func-name { font-family: var(--vscode-editor-font-family); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .trace-func-line { color: var(--vscode-descriptionForeground); flex-shrink: 0; }
   .ann-sec { font-size: 11px; font-weight: 600; opacity: 0.85; margin-top: 4px; }
-  .ann-density { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.4)); border-radius: 3px; padding: 2px 4px; font-size: 11px; }
-  /* AI_NOTE: 「解説の位置」は行の下/右余白の二択(ON/OFFではない)。トグルと区別するため左右セグメントで両選択肢を常時見せ、
-     選択中だけ塗る。押せるのは非選択側だけ(選択側は onclick 無し=no-op)なので、同じ側連打で誤トグルしない。 */
-  .ann-seg { display: inline-flex; box-sizing: border-box; overflow: hidden; border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.4)); border-radius: 3px; }
-  .ann-seg-opt { flex: 1; background: transparent; color: var(--vscode-foreground); border: none; padding: 3px 0; font-size: 11px; text-align: center; cursor: pointer; }
-  .ann-seg-opt + .ann-seg-opt { border-left: 1px solid var(--vscode-input-border, rgba(128,128,128,0.4)); }
-  .ann-seg-opt:not(.sel):hover { background: var(--vscode-button-secondaryHoverBackground, rgba(128,128,128,0.25)); }
-  .ann-seg-opt.sel { background: var(--vscode-button-background); color: var(--vscode-button-foreground); cursor: default; }
   .ann-status { font-size: 11px; color: var(--vscode-descriptionForeground); }
   /* AI_NOTE: 選択待ちモード中のボタン強調と上部バナー */
   .tbtn.awaiting { background: #f0a500; color: #1e1e1e; border-color: #f0a500; }
@@ -2360,20 +2566,8 @@ ${mermaid}
   .tbtn.flash-ok { background: var(--vscode-testing-iconPassed, #4ec9b0); color: #1e1e1e; border-color: var(--vscode-testing-iconPassed, #4ec9b0); }
   .tbtn.flash-err { background: var(--vscode-errorForeground, #f14c4c); color: #fff; border-color: var(--vscode-errorForeground, #f14c4c); }
   .ann-await { font-size: 11px; padding: 5px 8px; border-left: 3px solid #f0a500; background: rgba(240,165,0,0.12); border-radius: 0 4px 4px 0; }
-  .ann-list { font-size: 11px; }
-  .ann-list > summary { cursor: pointer; color: var(--vscode-descriptionForeground); padding: 2px 0; user-select: none; }
   .ann-row { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 3px; border-left: 2px solid #f0a500; }
-  .ann-row.warning { border-left-color: #f55a5a; }
-  /* AI_NOTE: sub=「解説を表示」の下位トグル。左に16pxインデント＋アクセントを1px淡色にして親子を示す。ボタンも一段細く。 */
-  .ann-row.sub { margin-left: 16px; border-left: 1px solid var(--vscode-descriptionForeground); opacity: 0.92; }
-  .ann-row.sub > .tbtn, .ann-row.sub > .ann-seg { width: 134px; }
   .ann-row:hover { background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.06)); }
-  .ann-icon { flex-shrink: 0; width: 12px; text-align: center; }
-  .ann-line { flex-shrink: 0; font-family: var(--vscode-editor-font-family, monospace); font-size: 10px; opacity: 0.7; min-width: 28px; }
-  .ann-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ann-act { flex-shrink: 0; cursor: pointer; opacity: 0.6; padding: 0 3px; }
-  .ann-act:hover { opacity: 1; color: #4fc1ff; }
-  .ann-overflow { font-size: 10px; color: var(--vscode-descriptionForeground); padding: 4px; text-align: center; }
   /* AI_NOTE: 受信箱型のチャット履歴リスト */
   .chat-current-label { font-size: 10px; color: var(--vscode-descriptionForeground); margin-left: 6px; }
   .chist { font-size: 11px; margin-bottom: 6px; }
@@ -2886,7 +3080,7 @@ ${mermaid}
       const s = document.getElementById('ann-status');
       if (s) s.textContent = e.data.count === 0
         ? '解説 0件 — 「生成 (全体)」または「範囲を解析」を押してください'
-        : '解説 ' + e.data.count + '件 (⚠ ' + e.data.warn + ' / ℹ ' + e.data.info + ')' + (e.data.time ? ' ・ ' + e.data.time : '');
+        : '名称 ' + e.data.count + '箇所' + (e.data.time ? ' ・ ' + e.data.time : '');
     } else if (e.data && (e.data.type === 'annBusy' || e.data.type === 'annResult')) {
       // AI_NOTE: 生成系ボタンの状態表示。which→対象ボタンを引く(run=生成全体 / regen=再生成 / sel=範囲を解析)
       const id = e.data.which === 'regen' ? 'ann-regen-btn' : e.data.which === 'sel' ? 'ann-sel-btn' : 'ann-run-btn';
@@ -3166,50 +3360,45 @@ ${mermaid}
     }
 
     private async toggleExpand(nodeId: string, lineStart: number, lineEnd: number, label: string): Promise<void> {
+        // AI_NOTE: 背景と同じ区切りに説明だけ追加し、編集中の古い応答は表示へ反映しない。
         if (!this.currentDoc || !this.view) return;
         if (this.expandedData[nodeId]) {
             delete this.expandedData[nodeId];
+            this.staleExpansions.delete(nodeId);
             this.rerender();
             return;
         }
-        const source = this.currentDoc.getText();
-        const cached = this.llmCache.get<BlockExpansion>(this.expandKey(nodeId, source));
-        if (cached) {
-            this.expandedData[nodeId] = cached;
-            this.rerender();
-            return;
-        }
-        // AI_NOTE: #1 生成中フラグを立てて「分解中…」を出す。完了でキャッシュ保存して差し替える。
-        // 空結果(APIキー未設定/通信失敗)はフラグを下ろすので「分解できませんでした」に変わる(永久に分解中にならない)。
+        const document = this.currentDoc;
+        const source = document.getText();
+        const ticket = Symbol(nodeId);
+        this.expansionTickets.set(nodeId, ticket);
         this.expandedData[nodeId] = { overview: null, blocks: [] };
+        this.staleExpansions.delete(nodeId);
         this.expandGenerating.add(nodeId);
         this.rerender();
-        const docLines = source.split("\n");
-        const blockLines = docLines.slice(lineStart, lineEnd + 1);
+        const current = () => document.getText() === source
+            && this.currentDoc?.uri.toString() === document.uri.toString()
+            && this.expansionTickets.get(nodeId) === ticket;
         try {
-            const node = this.graphNodes.find((n) => n.id === nodeId);
-            // AI_NOTE: クラスは専用の概要項目を生成させる。未知の種別は従来どおり処理ブロックとして扱い、既存挙動を保つ。
-            const kind = node?.kind === "class" ? "class" : node?.kind === "function" ? "function" : "block";
-            const result = await generateBlockBreakdown(label || nodeId, blockLines, lineStart, kind);
-            // AI_NOTE: LLMの行範囲は無検証だと複数行文の途中で切れることがあるため、AST文境界にスナップして
-            // 隙間・重複を解消する(annotationResolverと同じ「座標はモデルを信用しない」方針)。overviewはスナップ対象外。
-            // stmt_spans取得に失敗(空配列)した場合はスナップせず従来通りblocksをそのまま使う(機能を殺さない)。
-            const stmtSpans = await getStmtSpans(this.extensionPath, source);
-            const snappedBlocks = stmtSpans.length > 0
-                ? snapBlocks(result.blocks, stmtSpans, lineStart, lineEnd)
-                : result.blocks;
-            const finalBlocks = splitSingleBlockByTopLevelStatements(
-                snappedBlocks, stmtSpans, lineStart, lineEnd, source.split("\n"),
-            );
-            const expansion: BlockExpansion = { overview: result.overview, blocks: finalBlocks };
-            this.expandedData[nodeId] = expansion;
-            if (finalBlocks.length > 0 || expansion.overview !== null) this.llmCache.set(this.expandKey(nodeId, source), expansion);
-        } catch (e) {
-            console.error("[AI Code Guide] breakdown failed:", e);
-            this.expandedData[nodeId] = { overview: null, blocks: [] };
+            const { graph, spans } = await this.parseSource(source);
+            if (graph.error) throw new Error(graph.error);
+            const nodes = graph.backgroundNodes ?? graph.nodes;
+            const result = await this.backgroundService.details(document.uri.toString(), source, nodes, spans, nodeId, current);
+            if (!current()) return;
+            this.expandedData[nodeId] = result;
+            this.expandedSources.set(nodeId, source.split("\n").slice(lineStart, lineEnd + 1).join("\n"));
+            this.meaningRanges = this.colorBackgrounds(this.backgroundService.peek(document.uri.toString(), source, nodes), nodes);
+        } catch (error) {
+            if (current()) {
+                this.expandedData[nodeId] = { overview: null, blocks: [] };
+                console.error("[AI Code Guide] detail:", error);
+            }
         } finally {
-            this.expandGenerating.delete(nodeId);
-            this.rerender();
+            if (this.expansionTickets.get(nodeId) === ticket) {
+                this.expandGenerating.delete(nodeId);
+                this.expansionTickets.delete(nodeId);
+                this.rerender();
+            }
         }
     }
 
@@ -3281,7 +3470,7 @@ ${mermaid}
     // AI_NOTE: 概要タブ本体。グループ未生成なら生成ボタン、生成済みならグループ見出し+所属カードを描く。
     private buildOverviewPane(): string {
         if (!this.currentDoc) {
-            return `<div class="msg">Pythonファイルを開くと概要を表示します</div>`;
+            return `<div class="msg">Python・JavaScript・TypeScriptファイルを開くと概要を表示します</div>`;
         }
         if (this.groupGenerating) {
             return `<div class="msg">概要グループを生成中…</div>`;
@@ -3476,36 +3665,22 @@ ${mermaid}
         const newTargets = (quotes ?? []).filter((q) => q.fileName && q.lineStart != null && q.lineEnd != null);
         try {
             const transcript = session.messages.slice(-10).map((m) => `${m.role === "user" ? "質問" : "回答"}: ${m.content}`).join("\n");
-            const { symbolLabel, blockLabel, explanation, targets } = await summarizeChatConclusion(transcript, code);
+            const { label, explanation, targets } = await summarizeChatConclusion(transcript, code);
             const touched = new Set<string>();
-            // AI_NOTE: 下線(symbol)は短い版・枠(block)は濃い版のlabelを充てる。kindはbuildLineAnnotation/保存済み注釈が持つ。
-            // (1)今回の引用箇所に新規作成(現ドキュメント由来のみ)。ann.explanation に結論の補足を載せる。
-            for (const quote of newTargets) {
-                if (quote.fileName !== documentFileName) continue;
-                const ann = buildLineAnnotation(code, quote.lineStart! - 1, quote.lineEnd! - 1, "");
-                if (!ann) continue;
-                ann.label = ann.kind === "symbol" ? symbolLabel : blockLabel;
-                ann.explanation = explanation;
+            // AI_NOTE: 会話リンクも名称Hoverだけに限定する。行範囲の引用から行全体・block注釈は作らず、
+            // モデルが返した名称をresolverで実コードへ再照合できた場合だけ追加する。
+            const inferred = resolveAnnotations(targets.map((target) => ({
+                ...target,
+                label,
+                explanation,
+            })), code).filter((annotation) => annotation.kind === "symbol");
+            for (const ann of inferred) {
                 this.chatLinkStore.add(documentUri, ann, session.id);
                 touched.add(documentUri);
             }
-            // AI_NOTE: 引用の行情報が無い普通のコード質問は、モデルが返した実コード文字列をresolverで再照合してから追加する。
-            // 一致しない捏造位置はresolveAnnotationsが落とし、行情報付き引用がある時は従来の確定位置だけを使う。
-            if (newTargets.length === 0) {
-                const inferred = resolveAnnotations(targets.map((target) => ({
-                    ...target,
-                    severity: "info" as const,
-                    label: target.kind === "symbol" ? symbolLabel : blockLabel,
-                    explanation,
-                })), code);
-                for (const ann of inferred) {
-                    this.chatLinkStore.add(documentUri, ann, session.id);
-                    touched.add(documentUri);
-                }
-            }
-            // (2)既存リンクを最新の結論へ更新(別ファイルの箇所も含む)。保存済みkindでlabelを選ぶ。
+            // (2)既存のsymbolリンクだけを最新の結論へ更新する。
             for (const { uri: u, link } of existing) {
-                const label = link.annotation.kind === "symbol" ? symbolLabel : blockLabel;
+                if (link.annotation.kind !== "symbol") continue;
                 this.chatLinkStore.update(u, link.annotation.id, label, explanation);
                 touched.add(u);
             }
@@ -3546,7 +3721,7 @@ ${mermaid}
     // 機能が別物（注釈生成の操作 vs 会話）なので独立タブに分離した（ユーザー要望）。
     private buildInlinePane(): string {
         if (!this.currentDoc) {
-            return `<div class="msg">Pythonファイルを開くとインライン解説を生成できます</div>`;
+            return `<div class="msg">Python・JavaScript・TypeScriptファイルを開くとインライン解説を生成できます</div>`;
         }
         return this.buildAnnotationsPanel();
     }
@@ -3557,18 +3732,20 @@ ${mermaid}
         if (!this.currentDoc) {
             return `<div class="msg">Pythonファイルを開くと関数を実行トレースできます</div>`;
         }
+        if (!languageProfile(this.currentDoc.languageId)?.canTrace) {
+            return `<div class="msg">実行トレースは現在Pythonだけに対応しています。構造・概要・図・解説・チャットはこの言語でも利用できます。</div>`;
+        }
         const row = (control: string, desc: string) => `<div class="ann-row">${control}<span class="ann-desc">${desc}</span></div>`;
         const statusHtml = `<div id="trace-status" class="ann-status">${escapeHtml(this.traceStatusText())}</div>`;
         return `<div class="ann-panel"><div class="ann-rows trace-rows">
       <div class="ann-sec">実行トレース — 関数を具体例で実際に動かし、各行に変数の実値を表示</div>
-      ${row(`<button class="tbtn on" onclick="traceRunSelected()">選んだ関数をトレース</button>`, "下でチェックした関数をまとめて実行（1つずつでも可・実行済みなら即表示・表示中は解説を一時的に隠す）")}
+      ${row(`<button class="tbtn on" onclick="traceRunSelected()">選んだ関数をトレース</button>`, "下でチェックした関数をまとめて実行（1つずつでも可・実行済みなら即表示）")}
       ${row(`<button class="tbtn" onclick="vscode.postMessage({type:'traceRun'})">カーソルの関数だけ</button>`, "カーソルを置いた関数1つだけをトレースする")}
       ${row(`<button class="tbtn" onclick="vscode.postMessage({type:'traceRegen'})">別の入力例で再実行</button>`, "キャッシュを無視して入力例から作り直す（表示中の関数すべて）")}
-      ${row(`<button class="tbtn" onclick="vscode.postMessage({type:'traceClear'})">解説表示に戻る</button>`, "トレースを消して、生成済みの解説表示に戻す")}
+      ${row(`<button class="tbtn" onclick="vscode.postMessage({type:'traceClear'})">トレースを消す</button>`, "エディタの実行値だけを消す")}
       ${this.traceFuncRows()}
       <div class="ann-sec">ショートカット</div>
       ${row(`<span class="ann-desc">⌥⌘T</span>`, "トレース実行（カーソルのある関数）")}
-      ${row(`<span class="ann-desc">⌥⌘C</span>`, "解説表示に戻る")}
       ${row(`<span class="ann-desc">⌥⌘← / ⌥⌘→</span>`, "前の周回 / 次の周回（カーソルのあるループが対象）")}
       <div class="ann-sec">見かた・操作</div>
       ${row(`<span class="ann-desc">◀ n周目/全m周 ▶</span>`, "ループ行の周回表示。切り替えは下の「ループの周回」ボタン、画面左下のステータスバーの「トレース n周目/全m周」、⌥⌘←/→のどれでも。行にホバーすると全周回の表")}
@@ -3580,7 +3757,7 @@ ${mermaid}
 
     private buildChatPane(): string {
         if (!this.currentDoc) {
-            return `<div class="msg">Pythonファイルを開くとそのコードについて質問できます</div>`;
+            return `<div class="msg">Python・JavaScript・TypeScriptファイルを開くとそのコードについて質問できます</div>`;
         }
         const sessions = this.chatStore.list();
         const session = this.currentChatId ? this.chatStore.get(this.currentChatId) : undefined;
@@ -3719,8 +3896,8 @@ ${mermaid}
     // AI_NOTE: 「選択範囲を解析」ボタンの click ハンドラ本体。awaitingSelection の状態遷移を担う
     private async handleAnnotateSelectionClick(): Promise<void> {
         const editor = this.getCurrentEditor() ?? vscode.window.activeTextEditor;
-        if (!editor || editor.document.languageId !== "python") {
-            vscode.window.showWarningMessage("AI Code Guide: Pythonファイルを開いてください。");
+        if (!editor || !isSupportedLanguage(editor.document.languageId)) {
+            vscode.window.showWarningMessage("AI Code Guide: Python・JavaScript・TypeScriptファイルを開いてください。");
             return;
         }
         if (this.awaitingSelection) {
@@ -3772,14 +3949,14 @@ ${mermaid}
     }
 
     // 名称辞書パネル。対象選定・密度・block/symbol別配置は廃止し、全名称を無装飾Hoverへ載せる。
-    // 注釈一覧は廃止: コードを見ながらホバー/CodeLensで読む運用が中心で、サイドバーから「行へ飛ぶ」需要がほぼ無かったため。
+    // 注釈一覧は廃止: コードを見ながら名称へホバーして読む運用が中心で、サイドバーから「行へ飛ぶ」需要がほぼ無かったため。
     // 件数バッジは「生成済みかどうか」「警告が混じっているか」だけ即見えればよいので 1行に集約する。
     private buildAnnotationsPanel(): string {
         if (!this.currentDoc) return "";
         const editor = this.getCurrentEditor();
         const data = editor ? this.annotationProvider.getAnnotations(editor) : { items: [] as SemanticAnnotation[], generatedAt: null as Date | null };
         const cfg = vscode.workspace.getConfiguration("aiCodeGuide");
-        const autoOn = cfg.get<boolean>("autoInlineAnnotations", false);
+        const autoOn = cfg.get<boolean>("autoInlineAnnotations", true);
         const showAnnotations = cfg.get<boolean>("showAnnotations", true);
         // AI_NOTE: 「範囲」ボタンの状態は本来カーソル/選択状態で変わるべきだが、選択変化のたび HTML 全再描画は重いので
         // 静的に「選択中→その範囲 / 未選択→カーソル上の関数」を tooltip に書いて伝える(annotate 側が実行時に分岐する)。
@@ -3801,14 +3978,16 @@ ${mermaid}
 
         // AI_NOTE: 横詰め(flex-wrap)はON↔OFFの文字数変化でボタン幅が変わり折り返し位置が動いて誤クリックを誘発した
         // (ユーザー指摘)ので、1行=1ボタン+説明の縦並びへ変更。説明を常時見せて「何のボタンか」を名前だけに頼らない。
-        // AI_NOTE: sub=true は「解説を表示」の下位トグル(下線だけ/ブロックだけ)。インデント＋細い淡アクセントで従属を見せる。
-        const row = (control: string, desc: string, sub = false) => `<div class="ann-row${sub ? " sub" : ""}">${control}<span class="ann-desc">${desc}</span></div>`;
+        const row = (control: string, desc: string) => `<div class="ann-row">${control}<span class="ann-desc">${desc}</span></div>`;
         const toggle = (msgType: string, on: boolean, label: string) =>
             `<button class="tbtn${on ? " on" : ""}" onclick="vscode.postMessage({type:'${msgType}'})">${label}: ${on ? "ON" : "OFF"}</button>`;
         const toolbar = `<div class="ann-rows">
       <div class="ann-sec">生成</div>
-      ${row(`<button id="ann-run-btn" class="tbtn on" onclick="vscode.postMessage({type:'annotateRun'})" title="Cmd+Alt+E でも実行できます">名称辞書 (全体)</button>`, "ファイル内の変数・関数・メソッド・クラスをすべて辞書化する")}
-      ${row(`<button id="ann-regen-btn" class="tbtn" onclick="vscode.postMessage({type:'annotateRegen'})">説明を再生成</button>`, "名称は変えず、短い説明だけを作り直す")}
+      <div class="ann-primary-actions">
+        <button id="ann-run-btn" class="tbtn on" onclick="vscode.postMessage({type:'annotateRun'})" title="ファイル内の変数・関数・メソッド・クラスをすべて辞書化する。Cmd+Alt+E でも実行できます">名称辞書</button>
+        <button id="ann-regen-btn" class="tbtn" onclick="vscode.postMessage({type:'annotateRegen'})" title="名称は変えず、短い説明だけをすべて作り直す">説明を再生成</button>
+      </div>
+      <div class="ann-primary-desc">名称辞書は未生成分だけ作成・再利用。再生成は全説明を作り直します。</div>
       ${row(selBtn, "選択範囲内の全名称を辞書化する")}
       ${row(`<button class="tbtn" onclick="vscode.postMessage({type:'annotateClear'})" title="${clearTip}">表示クリア</button>`, "Hover対象を消す（キャッシュは残る）")}
       ${row(toggle("toggleAutoAnnotate", autoOn, "自動生成"), "Pythonファイルを開いたら名称辞書を生成する")}
@@ -4050,7 +4229,6 @@ ${mermaid}
         const model = cfg.get<string>("model", "gpt-5.6-sol");
         const chatModel = cfg.get<string>("chatModel", "gpt-5.6-sol");
         const inlineModel = cfg.get<string>("inlineAnnotationModel", "gpt-5.6-sol");
-        const density = cfg.get<string>("inlineAnnotationDensity", "normal");
         const globalContext = cfg.get<string>("globalContext", "");
         const arrowSide = cfg.get<string>("arrowSide", "left");
         const subProvider = cfg.get<string>("subscriptionProvider", "codex");
@@ -4095,13 +4273,6 @@ ${mermaid}
         };
         const check = (key: string, on: boolean, label: string) =>
             `<label class="row"><input type="checkbox" ${on ? "checked" : ""} onchange="vscode.postMessage({type:'setConfig',key:'${key}',value:this.checked})"> ${label}</label>`;
-        const densityOpts = [
-            { v: "minimal", l: "最小（project固有＋重大箇所）" },
-            { v: "normal", l: "標準（変数・API・制御）" },
-            { v: "dense", l: "密（中間知識・設計判断も説明）" },
-            { v: "ultra", l: "超密（学習用に細部まで・トークン消費大）" },
-        ];
-
         return `<div class="settings">
   <div class="sgroup">
     <div class="stitle">モデル</div>
@@ -4114,13 +4285,7 @@ ${mermaid}
     <div class="stitle">自動実行</div>
     ${check("autoShowOnOpen", cfg.get<boolean>("autoShowOnOpen", false), "ファイルを開いたらパネルを自動表示")}
     ${check("autoDescribe", cfg.get<boolean>("autoDescribe", false), "マップ表示時にAI説明を自動生成（トークン消費）")}
-    ${check("autoInlineAnnotations", cfg.get<boolean>("autoInlineAnnotations", false), "ファイルを開いたらインライン解説を自動生成（トークン消費）")}
-  </div>
-  <div class="sgroup">
-    <div class="stitle">インライン解説の密度</div>
-    <select onchange="vscode.postMessage({type:'setConfig',key:'inlineAnnotationDensity',value:this.value})">
-      ${densityOpts.map((o) => `<option value="${o.v}"${o.v === density ? " selected" : ""}>${o.l}</option>`).join("")}
-    </select>
+    ${check("autoInlineAnnotations", cfg.get<boolean>("autoInlineAnnotations", true), "ファイルを開いたらインライン解説を自動生成（トークン消費）")}
   </div>
   <div class="sgroup">
     <div class="stitle">グローバル文脈</div>
@@ -4530,7 +4695,7 @@ ${mermaid}
     private buildProcessPane(): string {
         const finderHtml = this.buildProjectDiagramFinder();
         if (!this.projectData) {
-            return `${finderHtml}<div class="process-map-empty">${this.projectAnalyzing ? "プロジェクトを解析中…" : "Pythonファイルの構成を解析すると、質問に合う図を作成できます。"}</div>`;
+            return `${finderHtml}<div class="process-map-empty">${this.projectAnalyzing ? "プロジェクトを解析中…" : "対応コードの構成を解析すると、質問に合う図を作成できます。"}</div>`;
         }
         if (!this.projectDiagram) {
             return `${finderHtml}<div class="process-map-empty">処理の流れや機能の依存関係など、コードについて知りたいことを入力してください。</div>`;
@@ -4562,7 +4727,7 @@ ${mermaid}
         }
         if (this.projectAnalyzing) return `<div class="msg">プロジェクトを解析中…</div>`;
         const { nodes, edges } = this.projectData;
-        if (nodes.length === 0) return `<div class="msg">Pythonファイルが見つかりませんでした</div>`;
+        if (nodes.length === 0) return `<div class="msg">対応するコードファイルが見つかりませんでした</div>`;
         const idToRel = new Map(nodes.map((n) => [n.id, n.rel_path]));
         const importsOf = new Map<string, string[]>();
         for (const e of edges) {
@@ -4663,6 +4828,10 @@ ${mermaid}
     private buildSubCards(nodeId: string, sym: DesignSymbol | undefined, designIssues: DesignIssue[], includeDesign = true): string {
         const designBlock = includeDesign ? this.buildDesignSymbolBlock(sym, designIssues) : "";
         const data = this.expandedData[nodeId];
+        // AI_NOTE: 開いた詳細も保存で勝手に再生成しない。旧本文を最新の座標に対応させない。
+        if (this.staleExpansions.has(nodeId)) {
+            return `<div class="subwrap"><div class="submsg">編集前の説明です。<button class="tbtn" onclick="vscode.postMessage({type:'retryExpand',nodeId:'${escapeHtml(nodeId)}'})">詳細を更新</button></div><div>${escapeHtml(data?.overview?.purpose ?? "")}</div></div>`;
+        }
         if (this.expandGenerating.has(nodeId)) {
             return `<div class="subwrap">${designBlock}<div class="submsg">分解中…</div></div>`;
         }

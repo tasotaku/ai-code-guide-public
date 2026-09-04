@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import type { LocatedProjectDiagram } from "./projectDiagram";
+import type { TracePlayback } from "../inline/tracePlayback";
+import { buildProjectDiagramHtml } from "./projectDiagram";
 import { buildTraceWebView, type TraceWebViewData } from "./traceWebView";
 import { buildInlineWebView, type InlineWebViewData } from "./inlineWebView";
 import { buildStandardWebView, type StandardWebViewData } from "./standardWebView";
@@ -54,12 +56,26 @@ export type AgentShowRequest = {
     run?: boolean;
     activate?: boolean;
     focusWindow?: boolean;
+    backgroundAction?: "read" | "generate" | "stop";
+    retryLayer?: "background" | "inline";
+    expectedSourceSha256?: string;
+};
+export type AgentLayerState = {
+    status: "idle" | "queued" | "generating" | "ready" | "stale" | "stopped" | "error";
+    completed: number;
+    total: number;
+    message?: string;
+    retryable?: boolean;
 };
 export type AgentShowResult = {
     ok: true;
     view: AgentView;
     file?: string;
     line?: number;
+    sourceSha256?: string;
+    revision?: number;
+    sourceChanged?: boolean;
+    layers?: Partial<Record<"background" | "inline" | "diagram" | "trace", AgentLayerState>>;
     jumpReceipt?: {
         receiptId: string;
         acknowledged: true;
@@ -76,6 +92,7 @@ export type AgentShowResult = {
         file: string;
         role?: string;
         source: AgentCodeLine[];
+        backgroundRanges?: Array<{ lineStart: number; lineEnd: number; label?: string; colorIndex?: number }>;
         items: Array<{
             id: string;
             kind: "function" | "class" | "constant";
@@ -84,6 +101,12 @@ export type AgentShowResult = {
             lineEnd: number;
             parent?: string;
             color?: string;
+            meaningRanges?: Array<{
+                lineStart: number;
+                lineEnd: number;
+                label?: string;
+                colorIndex?: number;
+            }>;
             description?: string;
             expanded?: boolean;
             expansion?: {
@@ -132,8 +155,7 @@ export type AgentShowResult = {
         };
         items: Array<{
             id: string;
-            kind: "symbol" | "block";
-            severity: "info" | "warning";
+            kind: "symbol";
             label: string;
             explanation: string;
             startLine: number;
@@ -194,6 +216,7 @@ export type AgentShowResult = {
             startLine: number;
             endLine: number;
             code: AgentCodeLine[];
+            playback?: TracePlayback;
             loop?: { headerLine: number; total: number; actualTotal: number };
             iterations: Array<{ number: number; values: Array<{ line: number; text: string }> }>;
         }>;
@@ -212,8 +235,9 @@ type BridgeOptions = {
         current: string;
         question: string;
         history: Array<{ role: "user" | "assistant"; content: string }>;
+        expectedSourceSha256?: string;
     }) => Promise<{ answer: string; explanation: string }>;
-    updateSymbolExplanation?: (file: string, symbolKey: string, explanation: string) => Promise<void>;
+    updateSymbolExplanation?: (file: string, symbolKey: string, explanation: string, expectedSourceSha256?: string) => Promise<void>;
     getManifestPath?: () => string | undefined;
     getRegistryPath?: () => string | undefined;
     getActivationPath?: () => string | undefined;
@@ -226,6 +250,8 @@ type CombinedCodexView = {
     diagram?: AgentShowResult;
     inline?: AgentShowResult;
     trace?: AgentShowResult;
+    layers?: AgentShowResult["layers"];
+    additionRequests?: Partial<Record<"diagram" | "trace", AgentShowRequest>>;
 };
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -241,6 +267,8 @@ export class ProjectDiagramBridge {
     private link: ProjectDiagramBridgeLink | null = null;
     private readonly writtenManifestPaths = new Set<string>();
     private readonly codexViews = new Map<string, AgentShowResult>();
+    private readonly codexSources = new Map<string, AgentShowRequest>();
+    private readonly preparationJobs = new Set<Promise<void>>();
     private readonly combinedCodexViews = new Map<string, CombinedCodexView>();
     private readonly openedCodexViews = new Map<string, { view: AgentView | "combined"; openedAt: string }>();
     private readonly symbolVersions = new Map<string, string[]>();
@@ -281,6 +309,7 @@ export class ProjectDiagramBridge {
         this.server = null;
         this.link = null;
         this.codexViews.clear();
+        this.codexSources.clear();
         this.combinedCodexViews.clear();
         this.openedCodexViews.clear();
         this.removeManifest();
@@ -412,6 +441,7 @@ export class ProjectDiagramBridge {
     // AI_NOTE: 範囲生成は永続キャッシュ上で既存注釈へマージされる。同じファイルの既存Webプレビューも
     // スナップショットのまま取り残さず、更新範囲だけを最新応答へ差し替える。全体要求は全件を正とする。
     private updateStoredInlineViews(result: AgentShowResult, source: AgentShowRequest | undefined): void {
+        // AI_NOTE: 同じファイル名でも別snapshotへの説明移植はしない。
         if (result.view !== "inline" || !result.file || !result.annotations || !source) return;
         const updateStart = source.startLine;
         const updateEnd = source.endLine;
@@ -421,6 +451,7 @@ export class ProjectDiagramBridge {
         ]);
         for (const [id, stored] of this.codexViews) {
             if (stored.view !== "inline" || stored.file !== result.file || !stored.annotations) continue;
+            if (stored.sourceSha256 !== result.sourceSha256) continue;
             const retained = stored.annotations.items.filter((item) => !omittedIds.has(item.id));
             const merged = updateStart === undefined || updateEnd === undefined
                 ? result.annotations.items
@@ -450,9 +481,11 @@ export class ProjectDiagramBridge {
         symbolKey: string,
         explanation: string,
         conversation: Array<{ role: "user" | "assistant"; content: string }>,
+        sourceSha256?: string,
     ): void {
+        // AI_NOTE: 質問による更新もコードidentityで分離し、旧URLから最新コードへ書き戻さない。
         for (const [id, stored] of this.codexViews) {
-            if (stored.view !== "inline" || stored.file !== file || !stored.annotations) continue;
+            if (stored.file !== file || !stored.annotations || stored.sourceSha256 !== sourceSha256) continue;
             this.codexViews.set(id, {
                 ...stored,
                 annotations: {
@@ -468,9 +501,10 @@ export class ProjectDiagramBridge {
             });
         }
         for (const combined of this.combinedCodexViews.values()) {
-            const stored = combined.inline;
-            if (!stored || stored.file !== file || !stored.annotations) continue;
-            combined.inline = {
+            const key = combined.inline?.annotations ? "inline" : "standard";
+            const stored = combined[key];
+            if (!stored || stored.file !== file || !stored.annotations || stored.sourceSha256 !== sourceSha256) continue;
+            combined[key] = {
                 ...stored,
                 annotations: {
                     ...stored.annotations,
@@ -487,7 +521,8 @@ export class ProjectDiagramBridge {
     }
 
     private storeCodexView(result: AgentShowResult, source?: AgentShowRequest): AgentShowResult {
-        const publicResult = this.symbolOnlyInlineResult(result);
+        // AI_NOTE: UIの開閉状態や後着更新が他URLへ漏れないようsnapshotを複製する。
+        const publicResult = JSON.parse(JSON.stringify(this.symbolOnlyInlineResult(result))) as AgentShowResult;
         const supported = (publicResult.view === "trace" && publicResult.trace)
             || (publicResult.view === "inline" && publicResult.annotations)
             || (publicResult.view === "standard" && publicResult.standard)
@@ -496,15 +531,130 @@ export class ProjectDiagramBridge {
         this.updateStoredInlineViews(publicResult, source);
         const id = crypto.randomBytes(24).toString("hex");
         this.codexViews.set(id, publicResult);
+        if (source) this.codexSources.set(id, { ...source });
         while (this.codexViews.size > MAX_CODEX_VIEWS) {
             const oldest = this.codexViews.keys().next().value as string | undefined;
             if (!oldest) break;
             this.codexViews.delete(oldest);
+            this.codexSources.delete(oldest);
         }
         return {
             ...publicResult,
             codexView: { type: "browser", url: `${this.link.baseUrl}/view/${id}`, view: publicResult.view },
         };
+    }
+
+    private async refreshSnapshot(result: AgentShowResult, action: "read" | "generate" | "stop", source?: AgentShowRequest, retryLayer?: "background" | "inline"): Promise<AgentShowResult> {
+        // AI_NOTE: /stateはcache読取だけ。古いコードを現在の文書へ無言で置換しない。
+        if (!result.sourceSha256 || !result.file || !this.options.showView) return result;
+        const resolved = this.resolveWorkspaceFile(result.file);
+        if (!("absoluteFile" in resolved)) throw new Error(resolved.message);
+        try {
+            const next = await this.options.showView({
+                view: "standard", absoluteFile: resolved.absoluteFile, activate: false,
+                backgroundAction: action, expectedSourceSha256: result.sourceSha256,
+                ...(retryLayer ? { retryLayer } : {}),
+            });
+            if (next.sourceSha256 !== result.sourceSha256) throw new Error("Source changed; request a new view");
+            const standard = next.standard && result.standard ? {
+                ...focusStandardView(next.standard, source?.scopeLine, source?.visibleExpandLines),
+                items: focusStandardView(next.standard, source?.scopeLine, source?.visibleExpandLines).items.map(item => {
+                    const previous = result.standard!.items.find(candidate => candidate.id === item.id);
+                    const sameRanges = JSON.stringify(previous?.meaningRanges ?? result.standard?.backgroundRanges) === JSON.stringify(item.meaningRanges ?? next.standard?.backgroundRanges);
+                    return previous?.expansion && sameRanges ? { ...item, expansion: previous.expansion, expanded: previous.expanded } : item;
+                }),
+            } : result.standard;
+            return { ...result, ...next, view: result.view, standard, sourceChanged: false };
+        } catch (error) {
+            if (error instanceof Error && error.message.includes("Source changed")) return { ...result, sourceChanged: true };
+            throw error;
+        }
+    }
+
+    private combinedData(combined: CombinedCodexView): CombinedWebViewData {
+        // AI_NOTE: 既定二層は標準snapshotから同時に届き、追加ジョブは独立した進捗を持つ。
+        return {
+            file: combined.file, standard: combined.standard?.standard,
+            sourceSha256: combined.standard?.sourceSha256, revision: combined.standard?.revision,
+            sourceChanged: combined.standard?.sourceChanged,
+            layers: { ...combined.standard?.layers, ...combined.layers },
+            diagram: combined.diagram?.diagram,
+            ...(combined.diagram?.diagram ? { diagramHtml: buildProjectDiagramHtml(combined.diagram.diagram, undefined, undefined, { selectableNodes: true }) } : {}),
+            annotations: combined.inline?.annotations ?? combined.standard?.annotations,
+            trace: combined.trace?.trace,
+        };
+    }
+
+    private async handleLayers(request: http.IncomingMessage, response: http.ServerResponse, id: string, result: AgentShowResult, combined?: CombinedCodexView): Promise<void> {
+        // AI_NOTE: 生成は明示操作だけ。変更済みsnapshotからの更新は別URLを作り元コードを保持する。
+        if (request.method !== "POST") { this.reply(response, 405, "Method Not Allowed"); return; }
+        if (!result.standard) { this.reply(response, 400, "Standard view unavailable"); return; }
+        let body: Record<string, unknown>;
+        try { body = await this.readJsonBody(request); } catch { this.reply(response, 400, "Invalid JSON"); return; }
+        if (body.action !== "generate" && body.action !== "stop") { this.reply(response, 400, "Invalid layer action"); return; }
+        try {
+            const next = await this.refreshSnapshot(result, body.action, this.codexSources.get(id));
+            if (next.sourceChanged && body.action === "generate" && result.file && this.options.showView) {
+                const resolved = this.resolveWorkspaceFile(result.file);
+                if (!("absoluteFile" in resolved)) throw new Error(resolved.message);
+                const source: AgentShowRequest = { view: "standard", absoluteFile: resolved.absoluteFile, backgroundAction: "generate", activate: false };
+                this.replyJson(response, 200, this.storeCodexView(await this.options.showView(source), source));
+                return;
+            }
+            if (combined) combined.standard = next; else this.codexViews.set(id, next);
+            this.replyJson(response, 200, combined ? this.combinedData(combined) : next);
+        } catch (error) { this.reply(response, 500, error instanceof Error ? error.message : "Layer action failed"); }
+    }
+
+    private startAddition(id: string, combined: CombinedCodexView, addition: "diagram" | "trace"): void {
+        // AI_NOTE: 初回と再試行は同じ保存済み要求で実行し、成功層や別snapshotへ作用しない。
+        const source = combined.additionRequests?.[addition];
+        if (!source || !this.options.showView) return;
+        combined.layers ??= {};
+        combined.layers[addition] = { status: "generating", completed: 0, total: 1 };
+        const job = Promise.resolve().then(() => this.options.showView!({ ...source })).then(result => {
+            if (this.combinedCodexViews.get(id) !== combined) return;
+            if (source.expectedSourceSha256 && result.sourceSha256 !== source.expectedSourceSha256) throw new Error("Source changed; request a new view");
+            combined[addition] = JSON.parse(JSON.stringify(result));
+            combined.layers![addition] = { status: "ready", completed: 1, total: 1 };
+        }).catch(error => {
+            if (this.combinedCodexViews.get(id) !== combined) return;
+            const message = error instanceof Error ? error.message : "Generation failed";
+            const changed = message.includes("Source changed");
+            if (changed && combined.standard) combined.standard.sourceChanged = true;
+            combined.layers![addition] = { status: "error", completed: 0, total: 1, message, retryable: !!source.expectedSourceSha256 && !changed };
+        });
+        this.preparationJobs.add(job);
+        void job.finally(() => this.preparationJobs.delete(job));
+    }
+
+    private async handleRetry(request: http.IncomingMessage, response: http.ServerResponse, id: string, result: AgentShowResult, combined?: CombinedCodexView): Promise<void> {
+        // AI_NOTE: capability URLに保存した対象だけを再試行。変更済みコードへの新URL生成は行わない。
+        if (request.method !== "POST") { this.reply(response, 405, "Method Not Allowed"); return; }
+        let body: Record<string, unknown>;
+        try { body = await this.readJsonBody(request); } catch { this.reply(response, 400, "Invalid JSON"); return; }
+        const layer = body.layer;
+        if (layer !== "background" && layer !== "inline" && layer !== "diagram" && layer !== "trace") { this.reply(response, 400, "Invalid retry layer"); return; }
+        if (!result.standard || !result.file || !result.sourceSha256 || !this.options.showView) { this.reply(response, 400, "Snapshot unavailable"); return; }
+        try {
+            const next = await this.refreshSnapshot(result, "read", this.codexSources.get(id));
+            if (combined) combined.standard = next; else this.codexViews.set(id, next);
+            if (next.sourceChanged) { this.reply(response, 409, "Source changed; request a new view"); return; }
+            const state = layer === "background" || layer === "inline" ? next.layers?.[layer] : combined?.layers?.[layer];
+            if (state?.status !== "error" || state.retryable === false) { this.reply(response, 409, "Layer is not retryable"); return; }
+            if (layer === "diagram" || layer === "trace") {
+                if (!combined?.additionRequests?.[layer]) { this.reply(response, 409, "Original request unavailable"); return; }
+                this.startAddition(id, combined, layer);
+            } else {
+                const refreshed = await this.refreshSnapshot(next, "read", this.codexSources.get(id), layer);
+                if (refreshed.sourceChanged) throw new Error("Source changed; request a new view");
+                if (combined) combined.standard = refreshed; else this.codexViews.set(id, refreshed);
+            }
+            this.replyJson(response, 200, combined ? this.combinedData(combined) : this.codexViews.get(id)!);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : "Retry failed";
+            this.reply(response, message.includes("Source changed") || message.includes("not retryable") ? 409 : 500, message);
+        }
     }
 
     private diagramSources(diagram: LocatedProjectDiagram): Record<string, AgentCodeLine[]> {
@@ -521,6 +671,45 @@ export class ProjectDiagramBridge {
             }
         }
         return sources;
+    }
+
+    private async handlePrepare(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+        // AI_NOTE: MCP応答後も生成を拡張側が所有する。コードだけ先に返し、追加図/traceは同じsnapshotへ後着する。
+        if (!this.options.showView) { this.reply(response, 501, "Agent views unavailable"); return; }
+        let body: Record<string, unknown>;
+        try { body = await this.readJsonBody(request); } catch { this.reply(response, 400, "Invalid JSON"); return; }
+        const additions = Array.isArray(body.additions) ? [...new Set(body.additions)] : [];
+        if (typeof body.file !== "string" || !Array.isArray(body.additions) || additions.some(value => value !== "diagram" && value !== "trace")
+            || typeof body.question !== "string" || !body.question.trim() || body.question.length > 2000
+            || (body.functions !== undefined && (!Array.isArray(body.functions) || body.functions.length !== 1 || typeof body.functions[0] !== "string" || !body.functions[0].trim() || body.functions[0].length > 200))) {
+            this.reply(response, 400, "Invalid preparation request"); return;
+        }
+        const resolved = this.resolveWorkspaceFile(body.file);
+        if (!("absoluteFile" in resolved)) { this.reply(response, resolved.status, resolved.message); return; }
+        try {
+            const initial = await this.options.showView({ view: "standard", absoluteFile: resolved.absoluteFile, backgroundAction: "generate", activate: false });
+            if (!initial.standard) throw new Error("Standard snapshot unavailable");
+            const id = crypto.randomBytes(24).toString("hex");
+            const combined: CombinedCodexView = { file: initial.file, standard: JSON.parse(JSON.stringify(initial)), layers: {}, additionRequests: {} };
+            this.combinedCodexViews.set(id, combined);
+            while (this.combinedCodexViews.size > MAX_CODEX_VIEWS) this.combinedCodexViews.delete(this.combinedCodexViews.keys().next().value!);
+            for (const addition of additions as Array<"diagram" | "trace">) {
+                if (addition === "trace" && !body.functions) {
+                    combined.layers!.trace = { status: "error", completed: 0, total: 1, retryable: false, message: "質問か対象に、実行する関数名を example() の形で含めてください。" };
+                    continue;
+                }
+                combined.additionRequests![addition] = {
+                    view: addition, absoluteFile: resolved.absoluteFile, activate: false, run: true,
+                    question: body.question, ...(addition === "trace" ? { functions: body.functions as string[] } : {}),
+                    expectedSourceSha256: initial.sourceSha256,
+                };
+                this.startAddition(id, combined, addition);
+            }
+            this.replyJson(response, 200, {
+                ok: true, view: "combined", ...this.combinedData(combined),
+                codexView: { type: "browser", view: "combined", url: `${this.link!.baseUrl}/view/${id}` },
+            });
+        } catch (error) { this.reply(response, 500, error instanceof Error ? error.message : "Preparation failed"); }
     }
 
     // AI_NOTE: MCPが並列生成したビューIDだけを合成対象にし、任意データを受け取らない。
@@ -551,12 +740,15 @@ export class ProjectDiagramBridge {
                 this.replyJson(response, 400, { ok: false, error: "Duplicate view type" });
                 return;
             }
-            combined[key] = result;
+            combined[key] = JSON.parse(JSON.stringify(result)) as AgentShowResult;
             combined.file ??= result.file;
             if (combined.file && result.file && combined.file !== result.file) {
                 this.replyJson(response, 400, { ok: false, error: "Views must use the same file" });
                 return;
             }
+            const knownHashes = Object.values(combined).filter(value => value && typeof value === "object" && "sourceSha256" in value)
+                .map(value => (value as AgentShowResult).sourceSha256).filter(Boolean);
+            if (new Set(knownHashes).size > 1) { this.reply(response, 409, "Source changed; request a new view"); return; }
         }
         const id = crypto.randomBytes(24).toString("hex");
         this.combinedCodexViews.set(id, combined);
@@ -580,18 +772,18 @@ export class ProjectDiagramBridge {
         action: string | undefined,
         combined: CombinedCodexView,
     ): Promise<void> {
+        // AI_NOTE: 状態取得は生成を開始せず、元snapshotに一致するcache結果だけを合成する。
+        if (action === "/layers" && combined.standard) { await this.handleLayers(request, response, id, combined.standard, combined); return; }
+        if (action === "/retry" && combined.standard) { await this.handleRetry(request, response, id, combined.standard, combined); return; }
         if (action === "/state") {
             if (request.method !== "GET") {
                 this.reply(response, 405, "Method Not Allowed");
                 return;
             }
-            this.replyJson(response, 200, {
-                view: "combined",
-                ...(combined.standard?.standard ? { standard: combined.standard.standard } : {}),
-                ...(combined.diagram?.diagram ? { diagram: combined.diagram.diagram } : {}),
-                ...(combined.inline?.annotations ? { annotations: combined.inline.annotations } : {}),
-                ...(combined.trace?.trace ? { trace: combined.trace.trace } : {}),
-            });
+            try {
+                if (combined.standard) combined.standard = await this.refreshSnapshot(combined.standard, "read");
+                this.replyJson(response, 200, { view: "combined", ...this.combinedData(combined) });
+            } catch (error) { this.reply(response, 500, error instanceof Error ? error.message : "State unavailable"); }
             return;
         }
         if (!action) {
@@ -601,13 +793,7 @@ export class ProjectDiagramBridge {
             }
             this.openedCodexViews.delete(id);
             this.openedCodexViews.set(id, { view: "combined", openedAt: new Date().toISOString() });
-            const data: CombinedWebViewData = {
-                file: combined.file,
-                standard: combined.standard?.standard,
-                diagram: combined.diagram?.diagram,
-                annotations: combined.inline?.annotations,
-                trace: combined.trace?.trace,
-            };
+            const data = this.combinedData(combined);
             this.replyHtml(response, 200, buildCombinedWebView(data, id));
             return;
         }
@@ -630,8 +816,9 @@ export class ProjectDiagramBridge {
                 return;
             }
             try {
-                const expanded = await this.options.showView({ view: "standard", absoluteFile: resolved.absoluteFile, line, expandLines: [line], activate: false });
+                const expanded = await this.options.showView({ view: "standard", absoluteFile: resolved.absoluteFile, line, expandLines: [line], activate: false, ...(combined.standard.sourceSha256 ? { expectedSourceSha256: combined.standard.sourceSha256 } : {}) });
                 if (!expanded.standard) throw new Error("Standard expansion unavailable");
+                if (combined.standard.sourceSha256 && combined.standard.sourceSha256 !== expanded.sourceSha256) throw new Error("Source changed; request a new view");
                 combined.standard = expanded;
                 this.replyJson(response, 200, { standard: expanded.standard });
             } catch (error) {
@@ -640,7 +827,7 @@ export class ProjectDiagramBridge {
             return;
         }
         if (action === "/ask") {
-            const inline = combined.inline;
+            const inline = combined.inline ?? combined.standard;
             if (request.method !== "POST" || !inline?.annotations || !inline.file || !this.options.updateSymbolExplanation) {
                 this.reply(response, request.method === "POST" ? 400 : 405, request.method === "POST" ? "Symbol dictionary unavailable" : "Method Not Allowed");
                 return;
@@ -656,7 +843,7 @@ export class ProjectDiagramBridge {
                 return;
             }
             const history = [...(inline.annotations.conversations?.[symbolKey] ?? [])];
-            const versionKey = `${inline.file}\0${symbolKey}`;
+            const versionKey = `${inline.file}\0${inline.sourceSha256 ?? ""}\0${symbolKey}`;
             const versions = this.symbolVersions.get(versionKey) ?? [];
             try {
                 let explanation: string;
@@ -666,14 +853,14 @@ export class ProjectDiagramBridge {
                     explanation = previous;
                 } else {
                     if (!this.options.refineSymbol) { this.reply(response, 400, "Symbol chat unavailable"); return; }
-                    const refined = await this.options.refineSymbol({ file: inline.file, symbolKey, display: item.label, kind: item.symbolKind, current: item.explanation, question, history });
+                    const refined = await this.options.refineSymbol({ file: inline.file, symbolKey, display: item.label, kind: item.symbolKind, current: item.explanation, question, history, ...(inline.sourceSha256 ? { expectedSourceSha256: inline.sourceSha256 } : {}) });
                     versions.push(item.explanation);
                     history.push({ role: "user", content: question }, { role: "assistant", content: refined.answer });
                     explanation = refined.explanation;
                 }
                 this.symbolVersions.set(versionKey, versions);
-                await this.options.updateSymbolExplanation(inline.file, symbolKey, explanation);
-                this.updateStoredSymbol(inline.file, symbolKey, explanation, history);
+                await this.options.updateSymbolExplanation(inline.file, symbolKey, explanation, inline.sourceSha256);
+                this.updateStoredSymbol(inline.file, symbolKey, explanation, history, inline.sourceSha256);
                 this.replyJson(response, 200, { explanation, history, canUndo: versions.length > 0 });
             } catch (error) {
                 this.reply(response, 500, error instanceof Error ? error.message : "Symbol refinement failed");
@@ -697,7 +884,8 @@ export class ProjectDiagramBridge {
     }
 
     private async handleCodexView(request: http.IncomingMessage, response: http.ServerResponse, url: URL): Promise<boolean> {
-        const match = /^\/view\/([a-f0-9]{48})(\/open|\/state|\/expand|\/ask)?$/.exec(url.pathname);
+        // AI_NOTE: capability URLの状態更新にもsnapshot identityを適用する。
+        const match = /^\/view\/([a-f0-9]{48})(\/open|\/state|\/expand|\/ask|\/layers|\/retry)?$/.exec(url.pathname);
         if (!match) return false;
         const [, id, action] = match;
         const combined = this.combinedCodexViews.get(id);
@@ -716,17 +904,18 @@ export class ProjectDiagramBridge {
             this.replyHtml(response, 410, "<!doctype html><meta charset=\"utf-8\"><title>表示期限切れ</title><p>この表示は期限切れです。会話からAI Code Guideの表示をもう一度開いてください。</p>");
             return true;
         }
+        if (action === "/layers") { await this.handleLayers(request, response, id, result); return true; }
+        if (action === "/retry") { await this.handleRetry(request, response, id, result); return true; }
         if (action === "/state") {
             if (request.method !== "GET") {
                 this.reply(response, 405, "Method Not Allowed");
                 return true;
             }
-            this.replyJson(response, 200, {
-                view: result.view,
-                ...(result.annotations ? { annotations: result.annotations } : {}),
-                ...(result.standard ? { standard: result.standard } : {}),
-                ...(result.diagram ? { diagram: result.diagram } : {}),
-            });
+            try {
+                const next = result.view === "standard" ? await this.refreshSnapshot(result, "read", this.codexSources.get(id)) : result;
+                this.codexViews.set(id, next);
+                this.replyJson(response, 200, next);
+            } catch (error) { this.reply(response, 500, error instanceof Error ? error.message : "State unavailable"); }
             return true;
         }
         if (!action) {
@@ -749,6 +938,9 @@ export class ProjectDiagramBridge {
                     ...(result.file ? { file: result.file } : {}),
                     ...(result.line ? { line: result.line } : {}),
                     standard: result.standard,
+                    sourceSha256: result.sourceSha256, revision: result.revision,
+                    layers: result.layers, annotations: result.annotations,
+                    sourceChanged: result.sourceChanged,
                 };
                 this.replyHtml(response, 200, buildStandardWebView(data, id));
             } else if (result.view === "diagram" && result.diagram) {
@@ -773,7 +965,7 @@ export class ProjectDiagramBridge {
                 this.reply(response, 405, "Method Not Allowed");
                 return true;
             }
-            if (result.view !== "inline" || !result.annotations || !result.file
+            if (!["inline", "standard"].includes(result.view) || !result.annotations || !result.file
                 || !this.options.updateSymbolExplanation) {
                 this.reply(response, 400, "Symbol dictionary unavailable");
                 return true;
@@ -795,7 +987,7 @@ export class ProjectDiagramBridge {
                 return true;
             }
             const history = [...(result.annotations.conversations?.[symbolKey] ?? [])];
-            const versionKey = `${result.file}\0${symbolKey}`;
+            const versionKey = `${result.file}\0${result.sourceSha256 ?? ""}\0${symbolKey}`;
             const versions = this.symbolVersions.get(versionKey) ?? [];
             try {
                 let explanation: string;
@@ -819,14 +1011,15 @@ export class ProjectDiagramBridge {
                         current: item.explanation,
                         question,
                         history,
+                        ...(result.sourceSha256 ? { expectedSourceSha256: result.sourceSha256 } : {}),
                     });
                     versions.push(item.explanation);
                     history.push({ role: "user", content: question }, { role: "assistant", content: refined.answer });
                     explanation = refined.explanation;
                 }
                 this.symbolVersions.set(versionKey, versions);
-                await this.options.updateSymbolExplanation(result.file, symbolKey, explanation);
-                this.updateStoredSymbol(result.file, symbolKey, explanation, history);
+                await this.options.updateSymbolExplanation(result.file, symbolKey, explanation, result.sourceSha256);
+                this.updateStoredSymbol(result.file, symbolKey, explanation, history, result.sourceSha256);
                 this.replyJson(response, 200, { explanation, history, canUndo: versions.length > 0 });
             } catch (error) {
                 console.error("[AI Code Guide] symbol refinement failed:", error);
@@ -869,8 +1062,10 @@ export class ProjectDiagramBridge {
                     line,
                     expandLines: [line],
                     activate: false,
+                    ...(result.sourceSha256 ? { expectedSourceSha256: result.sourceSha256 } : {}),
                 });
                 if (!expanded.standard) throw new Error("Standard expansion unavailable");
+                if (result.sourceSha256 && expanded.sourceSha256 !== result.sourceSha256) throw new Error("Source changed; request a new view");
                 this.codexViews.set(id, expanded);
                 this.replyJson(response, 200, { standard: expanded.standard });
             } catch (error) {
@@ -958,6 +1153,7 @@ export class ProjectDiagramBridge {
     }
 
     private async handleShow(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+        // AI_NOTE: 生成意図とsnapshot識別はHTTP境界で検証し、readをgenerateへ昇格しない。
         if (!this.options.showView) {
             this.replyJson(response, 501, { ok: false, error: "Agent views unavailable" });
             return;
@@ -976,6 +1172,10 @@ export class ProjectDiagramBridge {
         if (!view) {
             this.replyJson(response, 400, { ok: false, error: "Invalid view" });
             return;
+        }
+        if ((body.backgroundAction !== undefined && !["read", "generate", "stop"].includes(String(body.backgroundAction)))
+            || (body.expectedSourceSha256 !== undefined && (typeof body.expectedSourceSha256 !== "string" || !/^[a-f0-9]{64}$/.test(body.expectedSourceSha256)))) {
+            this.reply(response, 400, "Invalid background action or source identity"); return;
         }
         const line = body.line === undefined ? undefined : Number(body.line);
         if (line !== undefined && (!Number.isSafeInteger(line) || line < 1)) {
@@ -1094,6 +1294,8 @@ export class ProjectDiagramBridge {
                 run: body.run === true,
                 ...(body.activate === false ? { activate: false } : {}),
                 ...(body.focusWindow === true ? { focusWindow: true } : {}),
+                ...(body.backgroundAction ? { backgroundAction: body.backgroundAction as AgentShowRequest["backgroundAction"] } : {}),
+                ...(body.expectedSourceSha256 ? { expectedSourceSha256: body.expectedSourceSha256 as string } : {}),
             };
             const result = await this.options.showView(agentRequest);
             // AI_NOTE: Codex向けの限定表示は公開境界でも適用する。showView実装が完全な
@@ -1112,6 +1314,7 @@ export class ProjectDiagramBridge {
     }
 
     private async handle(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+        // AI_NOTE: preparation要求は既存の認証済みbridge境界内に限定する。
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         if (await this.handleCodexView(request, response, url)) return;
         if (url.searchParams.get("token") !== this.token) {
@@ -1123,6 +1326,7 @@ export class ProjectDiagramBridge {
                 ok: true,
                 workspaceRoot: this.options.getWorkspaceRoot() ?? null,
                 views: AGENT_VIEWS,
+                capabilities: ["llm-background-layers-v1", "source-snapshot-v1", "progressive-prepare-v1"],
                 openedViews: [...this.openedCodexViews].map(([id, receipt]) => ({ id, ...receipt })),
             });
             return;
@@ -1131,6 +1335,7 @@ export class ProjectDiagramBridge {
             await this.handleShow(request, response);
             return;
         }
+        if (url.pathname === "/prepare" && request.method === "POST") { await this.handlePrepare(request, response); return; }
         if (url.pathname === "/combine" && request.method === "POST") {
             await this.handleCombine(request, response);
             return;

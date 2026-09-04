@@ -612,6 +612,9 @@ class Tracer:
         # AI_NOTE: def行の行番号。最初のイベントで引数の初期値をこの行のstepとして出す(入力例の表示に使う)。
         self.func_line_start = func_line_start
         self.steps: list[dict[str, Any]] = []
+        # AI_NOTE: Preserve every observed line for offline playback/counts while
+        # leaving the legacy difference-only steps unchanged for editor views.
+        self.line_steps: list[dict[str, Any]] = []
         self.return_value: Any = None
         self.has_return = False
         self.overflow = False
@@ -666,8 +669,12 @@ class Tracer:
             # AI_NOTE: 最初のイベント=まだ1行も実行していない。この時点のローカル=引数なので def行のstepとして出す。
             if changed:
                 self.steps.append({"line": self.func_line_start, "iter_path": [], "changed": changed})
-        elif changed or self._loop_of_header(self.prev_line):
-            self.steps.append({"line": self.prev_line, "iter_path": self.prev_iter_path, "changed": changed})
+                self.line_steps.append(self.steps[-1])
+        else:
+            step = {"line": self.prev_line, "iter_path": self.prev_iter_path, "changed": changed}
+            self.line_steps.append(step)
+            if changed or self._loop_of_header(self.prev_line):
+                self.steps.append(step)
         self.prev_repr = now_repr
 
     def trace(self, frame: FrameType, event: str, arg: Any):
@@ -681,7 +688,7 @@ class Tracer:
             if event == "exception":
                 self.call_recorder.record_exception(frame, arg)
             return self.trace
-        if len(self.steps) >= MAX_STEPS:
+        if len(self.steps) >= MAX_STEPS or len(self.line_steps) >= MAX_STEPS:
             self.overflow = True
             return None
         if event == "line":
@@ -899,8 +906,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
                 "error": f"実行中に例外: {type(execution_error).__name__}: {execution_error}",
                 "stage": "run",
                 "steps": tracer.steps,
+                "line_steps": tracer.line_steps,
                 "loops": loops,
-                "iter_counts": build_iter_counts(tracer.steps, loops),
+                "iter_counts": build_iter_counts(tracer.line_steps, loops),
                 "return_value": None,
                 # Keep the source envelope identical to a successful trace so
                 # exception cards can still render code, line numbers, syntax
@@ -919,7 +927,8 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "loops": loops,
         "steps": tracer.steps,
-        "iter_counts": build_iter_counts(tracer.steps, loops),
+        "line_steps": tracer.line_steps,
+        "iter_counts": build_iter_counts(tracer.line_steps, loops),
         "return_value": {
             "short": renderer.short(tracer.return_value),
             "full": renderer.full(tracer.return_value),

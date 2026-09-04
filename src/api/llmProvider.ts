@@ -375,9 +375,19 @@ async function callCli(params: LlmParams, command: string): Promise<LlmResponse>
 
 // AI_NOTE: codex を起動して終了を待つ。最終回答は --output-last-message のファイルに出るので stdout は捨て、
 // stderr だけ拾ってエラー文に使う。ENOENT(CLI無し)と非0終了は LlmError に変換する。
+// Windowsのnpm global binは codex.cmd / codex.bat になり得る。Nodeのspawnはこれらを
+// executableとして直接起動すると EINVAL になるため、その2拡張子だけOS shellへ委ねる。
+// .exeやmacOS/Linuxの実体は従来どおりshellを介さず起動する。
+export function needsWindowsCommandShell(command: string, platform = process.platform): boolean {
+    return platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
+}
+
 function runCodex(command: string, args: string[], stdin: string, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
-        const child = spawn(command, args, { stdio: ["pipe", "ignore", "pipe"] });
+        const useCommandShell = needsWindowsCommandShell(command);
+        const executable = useCommandShell ? (process.env.ComSpec || "cmd.exe") : command;
+        const childArgs = useCommandShell ? ["/d", "/s", "/c", command, ...args] : args;
+        const child = spawn(executable, childArgs, { stdio: ["pipe", "ignore", "pipe"] });
         // AI_NOTE: 中断。runCli と同じくcloseを待たず即reject（UI即停止）。killはベストエフォート（SIGTERM+SIGKILL）。
         const onAbort = () => {
             try { child.kill(); child.kill("SIGKILL"); } catch { /* 既に終了は無視 */ }

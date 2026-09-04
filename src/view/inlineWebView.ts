@@ -11,8 +11,7 @@ export type InlineWebViewData = {
         conversations?: Record<string, ConversationMessage[]>;
         items: Array<{
             id: string;
-            kind: "symbol" | "block";
-            severity: "info" | "warning";
+            kind: "symbol";
             label: string;
             explanation: string;
             symbolKey?: string;

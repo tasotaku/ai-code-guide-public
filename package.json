@@ -1,8 +1,8 @@
 {
   "name": "ai-code-guide",
   "displayName": "AI Code Guide",
-  "description": "AI-powered code understanding: flowchart visualization and inline explanations for Python",
-  "version": "0.27.32",
+  "description": "AI-powered code understanding for Python, JavaScript, and TypeScript",
+  "version": "0.27.42",
   "publisher": "neoai-research",
   "repository": {
     "type": "git",
@@ -18,6 +18,10 @@
   "activationEvents": [
     "onStartupFinished",
     "onLanguage:python",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
     "onView:aiCodeGuide.mainView"
   ],
   "main": "./out/extension.js",
@@ -50,7 +54,10 @@
         }
       ]
     },
-    "commands": [
+      "commands": [
+        { "command": "aiCodeGuide.clearBackgroundCache", "title": "AI Code Guide: 意味背景のキャッシュを消去" },
+      { "command": "aiCodeGuide.updateDefaultLayers", "title": "AI Code Guide: 解説を更新" },
+      { "command": "aiCodeGuide.stopDefaultLayers", "title": "AI Code Guide: 生成を停止" },
       {
         "command": "aiCodeGuide.showFlowchart",
         "title": "AI Code Guide: Show Flowchart"
@@ -104,14 +111,6 @@
         "title": "AI Code Guide: 使い方（フルページ）を開く"
       },
       {
-        "command": "aiCodeGuide.annotateDetectedEdit",
-        "title": "AI Code Guide: 検知した編集範囲を解説"
-      },
-      {
-        "command": "aiCodeGuide.dismissDetectedEdit",
-        "title": "AI Code Guide: 編集検知の提案を閉じる"
-      },
-      {
         "command": "aiCodeGuide.copyDesignPrompt",
         "title": "AI Code Guide: 設計ファイル作成プロンプトをコピー"
       },
@@ -125,7 +124,7 @@
       },
       {
         "command": "aiCodeGuide.traceClear",
-        "title": "AI Code Guide: 実行トレースを解除（解説表示に戻る）"
+        "title": "AI Code Guide: 実行トレースを消す"
       }
     ],
     "configuration": {
@@ -195,7 +194,7 @@
         "aiCodeGuide.autoShowOnOpen": {
           "type": "boolean",
           "default": false,
-          "description": "Pythonファイルを開いたとき自動でコードマップパネルを表示する"
+          "description": "対応コードファイルを開いたとき自動でコードマップパネルを表示する"
         },
         "aiCodeGuide.arrowSide": {
           "type": "string",
@@ -240,101 +239,28 @@
           "default": "gpt-5.6-sol",
           "markdownDescription": "名称辞書の短い説明と実行トレース（実行例の準備コード生成）に使うモデル。\n\nモデル名の接頭辞でプロバイダを自動判定します（`claude-*` / `gpt-*` / `gemini-*`）。"
         },
-        "aiCodeGuide.inlineAnnotationDensity": {
-          "type": "string",
-          "default": "normal",
-          "enum": [
-            "minimal",
-            "normal",
-            "dense",
-            "ultra"
-          ],
-          "enumDescriptions": [
-            "最小限 — project固有の識別子と重大な非自明箇所だけ",
-            "標準 — 変数・馴染みの薄いAPI・意味のある制御も説明",
-            "密 — 中間変数・比較的よく使うAPI・二次的な設計判断も説明",
-            "超密 — 構文ノイズ以外を学習用に細部まで説明（トークン消費大）"
-          ],
-          "description": "旧インライン解説の密度設定。名称辞書は対象範囲の全名称を含むため、この設定は使用しません。",
-          "deprecationMessage": "名称辞書は全名称を対象にするため、密度設定は廃止されました。"
-        },
         "aiCodeGuide.autoInlineAnnotations": {
           "type": "boolean",
-          "default": false,
-          "description": "Pythonファイルを開いたときに名称辞書を自動生成する。既定はOFF（Cmd+Alt+E で手動生成）。"
+          "default": true,
+          "description": "保存済みの対応コードファイルの初回表示と手動保存時に、不足する名称辞書を自動生成する。入力停止・自動保存では再生成しない。OFFでも保存済みの説明は再利用する。"
         },
-        "aiCodeGuide.hideResolvedAnnotations": {
+        "aiCodeGuide.autoSemanticBackgrounds": {
           "type": "boolean",
           "default": true,
-          "description": "ホバーで「解決済み」にした注釈をエディタから隠す。OFFにすると解決済みも再表示される。"
-        },
-        "aiCodeGuide.warningsOnly": {
-          "type": "boolean",
-          "default": false,
-          "description": "バグ・問題の指摘(⚠ warning)だけを表示する。コードを読む前に危険箇所だけ確認したいときに使う。"
+          "description": "初回表示と手動保存時に、LLMによる意味区分の背景を自動準備する。入力停止・自動保存では再生成しない。"
         },
         "aiCodeGuide.showAnnotations": {
           "type": "boolean",
           "default": true,
           "description": "名称へのHover辞書を有効にする。コードの見た目は変更しません。OFFでも生成結果は保持されます。"
-        },
-        "aiCodeGuide.showHiddenAnnotations": {
-          "type": "boolean",
-          "default": false,
-          "description": "個別に「隠す」した注釈も一時的に表示する。ONにして「戻す」を押すと非表示を解除できる。"
-        },
-        "aiCodeGuide.showSymbolAnnotations": {
-          "type": "boolean",
-          "default": true,
-          "description": "旧symbol表示設定。名称辞書では全名称を対象にするため使用しません。",
-          "deprecationMessage": "名称辞書の表示は aiCodeGuide.showAnnotations へ統合されました。"
-        },
-        "aiCodeGuide.showBlockAnnotations": {
-          "type": "boolean",
-          "default": true,
-          "description": "旧ブロック解説設定。名称辞書ではブロック解説を生成・表示しません。",
-          "deprecationMessage": "ブロック解説は廃止されました。"
-        },
-        "aiCodeGuide.symbolAnnotationPlacement": {
-          "type": "string",
-          "default": "hover",
-          "enum": [
-            "below",
-            "right",
-            "hover"
-          ],
-          "enumDescriptions": [
-            "対象行の下にCodeLensで解説を出す",
-            "対象行の右余白に短いラベルを出す（詳細はホバー）。コードの行間が空かず、複数行を続けて読める",
-            "解説を常時表示しない。点線下線だけを出し、解説はホバーしたときに出す（既定）"
-          ],
-          "markdownDescription": "旧symbol配置設定。名称辞書は無装飾のHover表示に固定されています。",
-          "deprecationMessage": "名称辞書はコードを装飾せず、Hoverだけで表示します。"
-        },
-        "aiCodeGuide.showAnnotationStatusButtons": {
-          "type": "boolean",
-          "default": false,
-          "description": "注釈の状態表示と操作ボタン（状態:未読／読んだ／後で／解決／隠す）をエディタに表示する。トリアージ機能を使わないときはOFFにすると表示がすっきりする。"
-        },
-        "aiCodeGuide.autoAnnotateOnAiEdit": {
-          "type": "string",
-          "default": "suggest",
-          "enum": [
-            "off",
-            "suggest",
-            "auto"
-          ],
-          "enumDescriptions": [
-            "何もしない",
-            "範囲を示して解説ボタンを提案する（既定）",
-            "確認なしで即座に解説を生成する"
-          ],
-          "description": "一括変更（AI生成・ペースト等）を検知したときの動作。suggest=範囲を示して解説ボタンを提案 / auto=即生成 / off=何もしない"
         }
       }
     },
     "menus": {
       "commandPalette": [
+        { "command": "aiCodeGuide.clearBackgroundCache" },
+        { "command": "aiCodeGuide.updateDefaultLayers" },
+        { "command": "aiCodeGuide.stopDefaultLayers" },
         { "command": "aiCodeGuide.showFlowchart" },
         { "command": "aiCodeGuide.revealCurrentStandardCard" },
         { "command": "aiCodeGuide.showProjectFlowchart" },
@@ -348,8 +274,6 @@
         { "command": "aiCodeGuide.quoteSelectionToChat" },
         { "command": "aiCodeGuide.openWalkthrough" },
         { "command": "aiCodeGuide.openHelpPage" },
-        { "command": "aiCodeGuide.annotateDetectedEdit" },
-        { "command": "aiCodeGuide.dismissDetectedEdit" },
         { "command": "aiCodeGuide.copyDesignPrompt" },
         { "command": "aiCodeGuide.traceFunction" },
         { "command": "aiCodeGuide.traceFunctions" },
@@ -378,31 +302,31 @@
         "command": "aiCodeGuide.showFlowchart",
         "key": "ctrl+alt+v",
         "mac": "cmd+alt+v",
-        "when": "editorLangId == python"
+        "when": "editorLangId == python || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact"
       },
       {
         "command": "aiCodeGuide.explainBlockInline",
         "key": "ctrl+alt+e",
         "mac": "cmd+alt+e",
-        "when": "editorLangId == python"
+        "when": "editorLangId == python || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact"
       },
       {
         "command": "aiCodeGuide.clearBlockExplanations",
         "key": "ctrl+alt+c",
         "mac": "cmd+alt+c",
-        "when": "editorLangId == python"
+        "when": "editorLangId == python || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact"
       },
       {
         "command": "aiCodeGuide.quoteSelectionToChat",
         "key": "ctrl+alt+q",
         "mac": "cmd+alt+q",
-        "when": "editorHasSelection && editorLangId == python"
+        "when": "editorHasSelection && (editorLangId == python || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact)"
       },
       {
         "command": "aiCodeGuide.revealCurrentStandardCard",
         "key": "ctrl+alt+m",
         "mac": "cmd+alt+m",
-        "when": "editorLangId == python"
+        "when": "editorLangId == python || editorLangId == javascript || editorLangId == javascriptreact || editorLangId == typescript || editorLangId == typescriptreact"
       },
       {
         "command": "aiCodeGuide.traceFunction",
@@ -447,7 +371,7 @@
           {
             "id": "flowchart",
             "title": "フローチャート / マップを開く",
-            "description": "Python ファイルを開いて、構造をカードとフローチャートで見ます。\n- 標準タブ: 関数・クラスのカード一覧。\n- プロジェクトタブ: ファイル間の import 依存。\nショートカット: ⌘⌥V（Win/Linux: Ctrl+Alt+V）\n[フローチャートを表示](command:aiCodeGuide.showFlowchart)",
+            "description": "Python・JavaScript・TypeScriptファイルを開いて、構造をカードとフローチャートで見ます。\n- 標準タブ: 関数・クラスのカード一覧。\n- プロジェクトタブ: ファイル間の import 依存。\nショートカット: ⌘⌥V（Win/Linux: Ctrl+Alt+V）\n[フローチャートを表示](command:aiCodeGuide.showFlowchart)",
             "media": {
               "markdown": "walkthrough/flowchart.md"
             },
@@ -477,7 +401,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
-    "test": "npm run compile && npm run bundle && node scripts/run_python_tests.js && node tests/resolveCommand.test.js && node tests/commandRegistration.test.js && node tests/defaultSettings.test.js && node tests/llmProviderModels.test.js && node tests/annotationTargetHints.test.js && node tests/parserCommands.test.js && node tests/resolver.test.js && node tests/chatlinks.test.js && node tests/chatAutoAnnotations.test.js && node tests/chatCopy.test.js && node tests/statusStore.test.js && node tests/projectDiagramStore.test.js && node tests/projectDiagramContext.test.js && node tests/projectDiagramValidation.test.js && node tests/projectSymbolLocation.test.js && node tests/projectDiagramBridge.test.js && node tests/agentCli.test.js && node tests/launcherDispatch.test.js && node tests/mcpServer.test.js && node tests/mcpHttp.test.js && node tests/launcherApp.test.js && node tests/standardApp.test.js && node tests/detailApp.test.js && node tests/codeEvidenceApp.test.js && node tests/diagramApp.test.js && node tests/projectDiagram.test.js && node tests/projectDiagramView.test.js && node tests/gitExclude.test.js && node tests/gitDiff.test.js && node tests/tokenLog.test.js && node tests/bulkEditDetector.test.js && node tests/blockSnapper.test.js && node tests/webviewEscapes.test.js && node tests/design-parser.test.js && node tests/design-prompt.test.js && node tests/traceContract.test.js && node tests/traceSandbox.test.js && node tests/traceContext.test.js && node tests/traceProvider.test.js && node tests/trace_imports.test.js && node tests/trace_methods.test.js",
+    "test:loop-row-controls": "npm run compile && node tests/tracePlayback.test.js && node --test tests/loopRowControls.test.js",
+    "test": "npm run compile && npm run bundle && node scripts/run_python_tests.js && node tests/resolveCommand.test.js && node tests/commandRegistration.test.js && node tests/defaultSettings.test.js && node tests/llmProviderModels.test.js && node tests/parserCommands.test.js && node tests/javascriptParser.test.js && node tests/defaultLayerLifecycle.test.js && node tests/generationGate.test.js && node tests/semanticBackground.test.js && node tests/symbolDictionaryGeneration.test.js && node tests/progressiveLayers.test.js && node tests/generationNotice.test.js && node tests/retryLayers.test.js && node tests/symbolDictionaryCache.test.js && node tests/resolver.test.js && node tests/chatlinks.test.js && node tests/chatAutoAnnotations.test.js && node tests/chatCopy.test.js && node tests/statusStore.test.js && node tests/projectDiagramStore.test.js && node tests/projectDiagramContext.test.js && node tests/projectDiagramValidation.test.js && node tests/projectSymbolLocation.test.js && node tests/projectDiagramBridge.test.js && node tests/agentCli.test.js && node tests/launcherDispatch.test.js && node tests/mcpServer.test.js && node tests/mcpHttp.test.js && node tests/launcherApp.test.js && node tests/standardApp.test.js && node tests/detailApp.test.js && node tests/codeEvidenceApp.test.js && node tests/diagramApp.test.js && node tests/projectDiagram.test.js && node tests/projectDiagramView.test.js && node tests/gitExclude.test.js && node tests/gitDiff.test.js && node tests/tokenLog.test.js && node tests/blockSnapper.test.js && node tests/webviewEscapes.test.js && node tests/design-parser.test.js && node tests/design-prompt.test.js && node tests/traceContract.test.js && node tests/traceSandbox.test.js && node tests/traceContext.test.js && node tests/traceProvider.test.js && node tests/trace_imports.test.js && node tests/trace_methods.test.js",
     "audit:public": "python scripts/audit_public.py worktree"
   },
   "dependencies": {

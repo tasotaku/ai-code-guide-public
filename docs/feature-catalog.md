@@ -152,7 +152,8 @@ Macでは `Cmd`、Windows/Linuxでは同じ位置の `Ctrl` を使います。
 
 ## 対応範囲と安全境界
 
-- コード構造、注釈、トレースの対象言語はPython
+- コード構造、概要、プロジェクト構成、コード図、注釈、チャットはPython・JavaScript・TypeScriptに対応
+- 実行トレースはPythonのみ対応
 - LLMを使う機能にはAPIキーまたはログイン済みCLIが必要
 - トレースは任意コード実行を伴うため、副作用判定、`__main__` 非実行、10秒タイムアウトで危険を抑える。ただし完全なサンドボックスではない
 - localhostブリッジはランダムトークン付きで、ワークスペース外のファイルを拒否する
@@ -178,7 +179,9 @@ Macでは `Cmd`、Windows/Linuxでは同じ位置の `Ctrl` を使います。
 |---|---|
 | 起動、コマンド、イベント | `src/extension.ts` |
 | 10タブのWebview | `src/view/mainViewProvider.ts` |
-| Python構造解析 | `python/ast_parser.py`, `src/flowchart/astParser.ts` |
+| 共通解析契約・言語振り分け | `src/flowchart/astParser.ts`, `src/flowchart/languageSupport.ts` |
+| Python構造解析 | `python/ast_parser.py` |
+| JavaScript／TypeScript構造解析 | `src/flowchart/javascriptParser.ts` |
 | LLMプロンプト | `src/api/claudeClient.ts` |
 | プロバイダ共通化 | `src/api/llmProvider.ts` |
 | インライン解説 | `src/inline/blockExplanationProvider.ts`, `src/api/annotationResolver.ts` |

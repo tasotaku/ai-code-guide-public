@@ -20,14 +20,13 @@ const code = [
 
 const parsed = parseChatConclusion([
     "正の値だけを残す",
-    "内包表記で正の値だけをusefulへ集める",
     "後続のsumへ不要な0以下を渡さない。",
     '[{"kind":"symbol","line":1,"lineText":"    useful = [value for value in values if value > 0]","token":"value > 0"}]',
 ].join("\n"));
 assert.strictEqual(parsed.targets.length, 1);
 const resolved = resolveAnnotations(parsed.targets.map((target) => ({
     ...target,
-    label: parsed.symbolLabel,
+    label: parsed.label,
     explanation: parsed.explanation,
 })), code);
 assert.strictEqual(resolved.length, 1);
@@ -35,10 +34,10 @@ assert.strictEqual(resolved[0].startLine, 1);
 assert.strictEqual(code.split("\n")[1].slice(resolved[0].startCol, resolved[0].endCol), "value > 0");
 console.log("ok - 引用なしのコード質問をexact-textで解決する");
 
-const general = parseChatConclusion("一般的な説明\n一般的な説明です\nコード位置は特定しない。\n[]");
+const general = parseChatConclusion("一般的な説明\nコード位置は特定しない。\n[]");
 assert.deepStrictEqual(general.targets, []);
 console.log("ok - 一般質問はインライン対象を追加しない");
-const malformed = parseChatConclusion("要点\n詳しい要点\n補足\n[{broken]");
+const malformed = parseChatConclusion("要点\n補足\n[{broken]");
 assert.deepStrictEqual(malformed.targets, []);
 console.log("ok - 壊れた対象JSONは安全に追加しない");
 
@@ -54,11 +53,20 @@ assert.deepStrictEqual(invented, []);
 console.log("ok - 捏造anchorはresolverが破棄して追加しない");
 
 const tooMany = parseChatConclusion([
-    "要点", "詳しい要点", "補足", "```json",
+    "要点", "補足", "```json",
     JSON.stringify(Array.from({ length: 5 }, () => ({ kind: "symbol", lineText: "    return sum(useful)", token: "sum" }))),
     "```",
 ].join("\n"));
 assert.strictEqual(tooMany.targets.length, 3);
+
+const symbolOnly = parseChatConclusion([
+    "名称だけを説明する", "blockは保存しない", JSON.stringify([
+        { kind: "block", startLineText: "def total(values):", endLineText: "    return sum(useful)" },
+        { kind: "symbol", lineText: "    return sum(useful)", token: "sum" },
+    ]),
+].join("\n"));
+assert.deepStrictEqual(symbolOnly.targets.map((target) => target.kind), ["symbol"]);
+console.log("ok - 会話由来もblockを捨て名称symbolだけを残す");
 
 const providerSource = fs.readFileSync(path.join(__dirname, "..", "src", "view", "mainViewProvider.ts"), "utf8");
 assert.ok(providerSource.includes("const documentUri = document.uri.toString()"));

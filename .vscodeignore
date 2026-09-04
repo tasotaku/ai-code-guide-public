@@ -15,6 +15,7 @@ scripts/**
 .claude/**
 .vscode/**
 .vscode-test/**
+.loop-engineering/**
 .ai-code-guide/*.json
 .ai-code-guide/*.mjs
 **/*.ts

@@ -13,12 +13,11 @@ import { ChatLinkStore } from "./view/chatLinkStore";
 import { openHelpPage } from "./view/helpPage";
 import { resolveCommand } from "./util/resolveCommand";
 import { initSecretKeys, setSecretKey, getSecretKey, API_PROVIDERS, PROVIDER_DISPLAY, ApiProvider } from "./api/secretKeys";
-import { accumulateBulkChange, BulkChange } from "./inline/bulkEditDetector";
-import { getChangedLines } from "./util/gitDiff";
 import { buildDesignPrompt, DesignScope } from "./design/designPrompt";
 import { readExistingDesignMd } from "./design/designStore";
 import { classifyTraceSafety, safetyRetryGuidance, TraceSafetyDecision } from "./inline/traceContract";
 import { collectTraceDependencyContext } from "./inline/traceContext";
+import { isSupportedLanguage, SUPPORTED_LANGUAGE_IDS } from "./flowchart/languageSupport";
 
 // AI_NOTE: SemanticAnnotationProvider は globalStorageUri を必要とするため activate 内で初期化する
 let annotationProvider: SemanticAnnotationProvider | null = null;
@@ -45,14 +44,7 @@ export function activate(context: vscode.ExtensionContext): void {
     // AI_NOTE: HoverProvider として登録。アノテーション範囲をホバーすると解説ポップアップを表示する
     context.subscriptions.push(
         vscode.languages.registerHoverProvider(
-            { language: "python" },
-            annotationProvider
-        )
-    );
-    // AI_NOTE: CodeLensProvider として登録。該当行の上に label を常時表示（クリックでチャット）
-    context.subscriptions.push(
-        vscode.languages.registerCodeLensProvider(
-            { language: "python" },
+            SUPPORTED_LANGUAGE_IDS.map((language) => ({ language })),
             annotationProvider
         )
     );
@@ -96,11 +88,7 @@ export function activate(context: vscode.ExtensionContext): void {
             if (e.affectsConfiguration("aiCodeGuide.model")) refreshModelBar();
             // AI_NOTE: 注釈の見え方を変える設定は settings.json 直編集でも即反映させる(再生成はしない)。
             // 以前は置き場所だけ拾っており、サイドバーのボタン経由でしか他の表示設定が反映されなかった。
-            const displayKeys = [
-                "symbolAnnotationPlacement", "showAnnotationStatusButtons", "showAnnotations",
-                "showHiddenAnnotations", "showSymbolAnnotations", "showBlockAnnotations",
-                "hideResolvedAnnotations", "warningsOnly",
-            ];
+            const displayKeys = ["showAnnotations"];
             if (displayKeys.some(k => e.affectsConfiguration(`aiCodeGuide.${k}`))) {
                 for (const editor of vscode.window.visibleTextEditors) annotationProvider?.refreshVisibility(editor);
             }
@@ -261,19 +249,26 @@ export function activate(context: vscode.ExtensionContext): void {
     // AI_NOTE: #14 カーソル連動・装飾・パネル表示はサイドバー(MainViewProvider)が自前で購読するため、
     // ここではセッションログと autoInlineAnnotations(インライン解説の自動生成)だけを扱う。
     async function onActiveEditorChanged(editor: vscode.TextEditor | undefined): Promise<void> {
-        if (!editor || editor.document.languageId !== "python") return;
-
-        // AI_NOTE: ① autoInlineAnnotations=true なら生成(有料)。false でもキャッシュ済みの説明は無料復元して既定表示にする。
-        const autoAnnotate = vscode.workspace.getConfiguration("aiCodeGuide").get<boolean>("autoInlineAnnotations", false);
-        if (autoAnnotate) {
-            annotationProvider?.annotateFile(editor);
-        } else {
-            annotationProvider?.restoreFromCache(editor);
-        }
+        if (!editor || !isSupportedLanguage(editor.document.languageId)) return;
+        // AI_NOTE: 初回・保存待ち・停止を共通管理し、タブ往復だけで編集中のLLM生成を再開しない。
+        await mainViewProvider.prepareDefaultLayers(editor.document, "open");
     }
 
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(onActiveEditorChanged)
+    );
+
+    // AI_NOTE: 保存せず読み直す明示入口。標準パネルが閉じていても操作できる。
+    context.subscriptions.push(
+        vscode.commands.registerCommand("aiCodeGuide.updateDefaultLayers", async () => {
+            const editor = vscode.window.activeTextEditor ?? vscode.window.visibleTextEditors.find(item => isSupportedLanguage(item.document.languageId));
+            if (editor) await mainViewProvider.prepareDefaultLayers(editor.document, "explicit");
+        }),
+        vscode.commands.registerCommand("aiCodeGuide.stopDefaultLayers", () => {
+            const editor = vscode.window.activeTextEditor ?? vscode.window.visibleTextEditors.find(item => isSupportedLanguage(item.document.languageId));
+            if (editor) mainViewProvider.stopDefaultLayers(editor.document);
+        }),
+        vscode.commands.registerCommand("aiCodeGuide.clearBackgroundCache", () => mainViewProvider.clearBackgroundCache()),
     );
 
     // AI_NOTE: インライン意味解説コマンド。Python ファイルのみ対象。
@@ -282,8 +277,8 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand("aiCodeGuide.explainBlockInline", async () => {
             const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document.languageId !== "python") {
-                vscode.window.showWarningMessage("AI Code Guide: Pythonファイルを開いてください。");
+            if (!editor || !isSupportedLanguage(editor.document.languageId)) {
+                vscode.window.showWarningMessage("AI Code Guide: Python・JavaScript・TypeScriptファイルを開いてください。");
                 return { status: "empty", count: 0 } as const;
             }
             return await annotationProvider?.annotateFile(editor) ?? { status: "empty", count: 0 } as const;
@@ -294,8 +289,8 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand("aiCodeGuide.regenerateBlockInline", async () => {
             const editor = vscode.window.activeTextEditor;
-            if (!editor || editor.document.languageId !== "python") {
-                vscode.window.showWarningMessage("AI Code Guide: Pythonファイルを開いてください。");
+            if (!editor || !isSupportedLanguage(editor.document.languageId)) {
+                vscode.window.showWarningMessage("AI Code Guide: Python・JavaScript・TypeScriptファイルを開いてください。");
                 return;
             }
             await annotationProvider?.annotateFile(editor, true);
@@ -306,15 +301,7 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.commands.registerCommand("aiCodeGuide.clearBlockExplanations", () => {
             const editor = vscode.window.activeTextEditor;
             if (!editor) return;
-            // AI_NOTE: トレース表示中のCmd+Alt+Cは「トレース解除→注釈をキャッシュ復元」。それ以外は従来どおり注釈クリア。
-            // トレースと注釈は排他表示(トレース開始時に注釈を隠す)なので、解除で元の注釈に戻すのが対称。
-            if (traceProvider.isActive(editor.document.uri.toString())) {
-                traceProvider.clear(editor);
-                annotationProvider?.restoreFromCache(editor);
-                mainViewProvider.refreshTraceStatus();
-            } else {
-                annotationProvider?.clearEditor(editor);
-            }
+            annotationProvider?.clearEditor(editor);
         })
     );
 
@@ -341,9 +328,6 @@ export function activate(context: vscode.ExtensionContext): void {
         const argsHash = createHash("sha1").update(stableArguments(callArguments)).digest("hex");
         return `${traceValueFormat}::${document.uri.toString()}::${contentHash}::${funcName}::${argsHash}`;
     };
-    // AI_NOTE: 注釈は右余白でトレースと場所が競合する。トレース中は注釈側の描画を止める
-    // (生成がトレース開始後に完了しても割り込まない)。
-    annotationProvider?.setTraceActiveCheck((uri) => traceProvider.isActive(uri));
     context.subscriptions.push({ dispose: () => traceProvider.dispose() });
     context.subscriptions.push(
         vscode.languages.registerHoverProvider({ language: "python" }, traceProvider)
@@ -417,9 +401,12 @@ export function activate(context: vscode.ExtensionContext): void {
         force: boolean,
         callArguments: Record<string, unknown> | undefined,
         onProgress: (message: string) => void,
+        isCurrent: () => boolean = () => true,
     ): Promise<{ result: TraceResult } | { rejected: TraceRejected } | { skipped: string }> => {
         // AI_NOTE: 制限モードでは構造表示・図解は使えるが、対象ワークスペースのPythonだけは実行しない。
         if (!vscode.workspace.isTrusted) return { skipped: "ワークスペースが未信頼のため実行トレースは無効" };
+        // AI_NOTE: 古いURLからの再試行は、入力例待ちや内部再実行の間の編集でもPythonへ送らない。
+        if (!isCurrent()) throw new Error("Source changed; request a new view");
         const cacheKey = traceCacheKey(document, source, funcName, callArguments);
         if (!force) {
             const hit = traceCache.get(cacheKey);
@@ -452,6 +439,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const exactSetup = callArguments === undefined
             ? example.setup
             : `${example.setup}\nEXAMPLE_ARGS = ()\nEXAMPLE_KWARGS = __import__('json').loads(${JSON.stringify(JSON.stringify(callArguments))})`;
+        if (!isCurrent()) throw new Error("Source changed; request a new view");
         let result = await runTrace(extensionPath, { source, func_name: funcName, setup: exactSetup, templates: example.templates, ...paths });
         let assertionFailure = result.assertions?.some((assertion) => !assertion.outcome) ?? false;
         if (result.error && (result.stage === "setup" || result.stage === "run") && !assertionFailure) {
@@ -459,6 +447,7 @@ export function activate(context: vscode.ExtensionContext): void {
             onProgress("入力例を作り直して再実行中");
             const retry = callArguments === undefined ? await generateTraceExample(source, funcName, { setup: example.setup, error: result.error }, dependencyContext) : null;
             if (retry && classifyTraceSafety(source, funcName, retry.safetyDecision) === "safe") {
+                if (!isCurrent()) throw new Error("Source changed; request a new view");
                 result = await runTrace(extensionPath, { source, func_name: funcName, setup: retry.setup, templates: retry.templates, ...paths });
                 assertionFailure = result.assertions?.some((assertion) => !assertion.outcome) ?? false;
             }
@@ -506,6 +495,7 @@ export function activate(context: vscode.ExtensionContext): void {
     // 1件の失敗で全体を止めない(スキップ理由は最後にまとめて通知)。同時実行数はLLMとpythonの負荷を見て3。
     context.subscriptions.push(
         vscode.commands.registerCommand("aiCodeGuide.traceFunctions", async (args?: {
+            expectedSourceSha256?: string;
             funcs?: string[];
             line?: number;
             force?: boolean;
@@ -526,6 +516,9 @@ export function activate(context: vscode.ExtensionContext): void {
                 return { funcNames: [], skipped: ["Pythonファイルが開かれていません"] };
             }
             const source = document.getText();
+            // AI_NOTE: コマンド呼出し前のAST解析・文書open待ちの後に、実行対象のhashを再検証する。
+            const isCurrent = () => !args?.expectedSourceSha256 || createHash("sha256").update(document.getText()).digest("hex") === args.expectedSourceSha256;
+            if (!isCurrent()) throw new Error("Source changed; request a new view");
             let names: string[];
             if (args?.funcs !== undefined) names = args.funcs;
             else if (args?.line !== undefined) {
@@ -552,7 +545,7 @@ export function activate(context: vscode.ExtensionContext): void {
                     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, names.length) }, async () => {
                         while (next < names.length) {
                             const funcName = names[next++];
-                            const outcome = await traceOne(document, source, funcName, args?.force ?? false, args?.arguments, () => {});
+                            const outcome = await traceOne(document, source, funcName, args?.force ?? false, args?.arguments, () => {}, isCurrent);
                             done++;
                             report(`${done}/${names.length} 完了`);
                             const attempt = commandAttempt(funcName, args?.arguments, outcome);
@@ -565,12 +558,10 @@ export function activate(context: vscode.ExtensionContext): void {
                         if (!args?.background) vscode.window.showErrorMessage(`AI Code Guide: すべての関数でトレースできませんでした — ${skipped.join(" / ")}`);
                         return { funcNames: [], skipped };
                     }
-                    // AI_NOTE: 排他表示。注釈(SemanticAnnotation)の右余白と場所が競合するため隠す(解除でキャッシュ復元)。
                     if (traces.length > 0) {
                         if (args?.background || !editor) {
                             traceProvider.storeTraces(document, traces);
                         } else {
-                            annotationProvider?.clearEditor(editor);
                             traceProvider.showTraces(editor, traces);
                         }
                         if (!args?.background) mainViewProvider.refreshTraceStatus();
@@ -629,7 +620,6 @@ export function activate(context: vscode.ExtensionContext): void {
             if (traces.length > 0) {
                 if (args?.background || !editor) traceProvider.storeTraces(document, traces);
                 else {
-                    annotationProvider?.clearEditor(editor);
                     traceProvider.showTraces(editor, traces);
                 }
                 if (!args?.background) mainViewProvider.refreshTraceStatus();
@@ -667,8 +657,6 @@ export function activate(context: vscode.ExtensionContext): void {
                         vscode.window.showWarningMessage(`AI Code Guide: ${funcName}() は実行しません — ${outcome.rejected.decision}: ${outcome.rejected.reason}`);
                         return { funcNames: [], skipped: [], attempts: attempt ? [attempt] : [] };
                     }
-                    // AI_NOTE: 排他表示。注釈(SemanticAnnotation)の右余白と場所が競合するため隠す(解除でキャッシュ復元)。
-                    annotationProvider?.clearEditor(editor);
                     traceProvider.showTrace(editor, outcome.result, funcName);
                     mainViewProvider.refreshTraceStatus();
                     return { funcNames: [funcName], skipped: [], attempts: attempt ? [attempt] : [] };
@@ -677,8 +665,7 @@ export function activate(context: vscode.ExtensionContext): void {
         })
     );
 
-    // AI_NOTE: トレース解除専用コマンド。サイドバーの「解説表示に戻る」から呼ぶ。clearBlockExplanations と違い、
-    // トレースが出ていない時は注釈を消さず案内だけ出す(切替ボタンとして押しても解説が消えない安全側)。
+    // AI_NOTE: トレース解除専用コマンド。名称ホバーとは共存するため、トレースだけを消す。
     context.subscriptions.push(
         vscode.commands.registerCommand("aiCodeGuide.traceClear", () => {
             const editor = vscode.window.activeTextEditor
@@ -689,7 +676,6 @@ export function activate(context: vscode.ExtensionContext): void {
                 return;
             }
             traceProvider.clear(editor);
-            annotationProvider?.restoreFromCache(editor);
             mainViewProvider.refreshTraceStatus();
         })
     );
@@ -712,13 +698,6 @@ export function activate(context: vscode.ExtensionContext): void {
             if (args?.uri !== undefined && args?.funcName !== undefined && args?.loopId !== undefined && args?.iter !== undefined) {
                 traceProvider.setIteration(args.uri, args.funcName, args.loopId, args.iter);
             }
-        })
-    );
-
-    // AI_NOTE: 重なった block 説明の前面/背面を切り替える。CodeLens から呼ばれ、LLM再生成はしない。
-    context.subscriptions.push(
-        vscode.commands.registerCommand("aiCodeGuide.toggleBlockLayer", (uri: string, groupId: string) => {
-            annotationProvider?.toggleBlockLayer(uri, groupId);
         })
     );
 
@@ -771,20 +750,6 @@ export function activate(context: vscode.ExtensionContext): void {
             }
         )
     );
-
-    // AI_NOTE: ホバーのトリアージ行/注釈行CodeLensから呼ばれる。注釈の状態(読んだ/後で見る/解決済み/未読)を保存し再描画する。
-    // status=null は未読へ戻す。LLM再生成はしない(id単位の状態更新と再フィルタのみ)。
-    context.subscriptions.push(
-        vscode.commands.registerCommand(
-            "aiCodeGuide.setAnnotationStatus",
-            (args: { uri?: string; id?: string; status?: "read" | "later" | "resolved" | null }) => {
-                if (args?.uri && args?.id) annotationProvider?.setAnnotationStatus(args.uri, args.id, args.status ?? null);
-            }
-        )
-    );
-
-    // AI_NOTE: symbol 状態CodeLensの「状態:○○」ラベル用の表示専用コマンド(押しても何もしない)。
-    context.subscriptions.push(vscode.commands.registerCommand("aiCodeGuide.noop", () => { /* 表示専用 */ }));
 
     // AI_NOTE: ようこそガイド(Walkthrough)を開くコマンド。ヘルプタブ/コマンドパレットから呼ぶ。
     // id は <publisher>.<name>#<walkthroughId>。標準コマンドに委譲するだけ。
@@ -862,55 +827,11 @@ export function activate(context: vscode.ExtensionContext): void {
     // 連打のたびに再描画すると重い/ちらつくので uri ごとに 150ms デバウンスして編集が落ち着いてから1回回す。
     const reanchorTimers = new Map<string, NodeJS.Timeout>();
 
-    // AI_NOTE: 一括変更(AI生成/ペースト等)検知の蓄積状態。uriごとに検知済み行集合と2000ms静止タイマーを持つ。
-    // 既存の150ms再アンカーとは別目的・別タイマーで共存させる(計画書の技術的決定事項)。
-    const bulkEditAccum = new Map<string, Set<number>>();
-    const bulkEditTimers = new Map<string, NodeJS.Timeout>();
-
-    // AI_NOTE: 静止タイマー発火時の確定処理。蓄積を取り出してクリア→対象editorを探す→全文リロードなら
-    // git差分で絞り直しを試みる→設定値(suggest/auto)で分岐してprovider(Step3実装予定)を呼ぶ。
-    // off時はそもそもタイマーが張られない(呼び出し元で入口ガード済み)。
-    async function resolveBulkEdit(uri: string): Promise<void> {
-        const lines = bulkEditAccum.get(uri);
-        bulkEditAccum.delete(uri);
-        bulkEditTimers.delete(uri);
-        if (!lines || lines.size === 0) return;
-
-        const editor = vscode.window.visibleTextEditors.find(ed => ed.document.uri.toString() === uri);
-        if (!editor) return;
-
-        let targetLines = lines;
-        const docLineCount = editor.document.lineCount;
-        const isWholeDoc = docLineCount > 0 && lines.size / docLineCount >= 0.8;
-        if (isWholeDoc) {
-            // AI_NOTE: エージェントがディスク上で書き換え→VSCodeが全文置換として通知するケースへの対策。
-            // git差分で絞り直せれば使い、失敗(git無し等)や差分空なら検知範囲をそのまま使う(例外は握りつぶさずログだけ出す)。
-            try {
-                const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
-                const cwd = folder?.uri.fsPath ?? path.dirname(editor.document.uri.fsPath);
-                const changed = await getChangedLines(editor.document.uri.fsPath, cwd);
-                if (changed.size > 0) targetLines = changed;
-            } catch (e) {
-                console.warn(`AI Code Guide: 全文リロード検知時のgit差分取得に失敗、検知範囲をそのまま使用します。${e instanceof Error ? e.message : String(e)}`);
-            }
-        }
-
-        const mode = vscode.workspace.getConfiguration("aiCodeGuide").get<string>("autoAnnotateOnAiEdit", "suggest");
-        if (mode === "auto") {
-            await annotationProvider?.annotateSuggested(editor, targetLines);
-        } else if (mode === "suggest") {
-            annotationProvider?.showSuggestion(editor, targetLines);
-        }
-    }
-
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument((e) => {
-            // AI_NOTE: [レビュー] "全ドキュメント変更で毎回タイマー登録(出力パネル/設定/git も)" → python 以外は
-            // そもそも注釈対象外なので入口で弾き、無駄なデバウンスタイマー登録を避ける。
-            if (e.document.languageId !== "python") return;
-            // AI_NOTE: URI 比較。debug 起動直後など editor.document と event.document が別インスタンスのことがある
+            if (e.document.languageId !== "python" || !e.contentChanges.length) return;
             const uri = e.document.uri.toString();
-            // AI_NOTE: トレースは実行時点のコード行に紐づくため編集追従(再アンカー)せず、編集されたら即消す。
+            // AI_NOTE: トレースは実行時点のコード行に紐づくため編集されたら消し、名称辞書はキャッシュ済み説明を再アンカーする。
             traceProvider.handleDocEdit(uri);
             const existing = reanchorTimers.get(uri);
             if (existing) clearTimeout(existing);
@@ -919,45 +840,8 @@ export function activate(context: vscode.ExtensionContext): void {
                 const editor = vscode.window.visibleTextEditors.find(ed => ed.document.uri.toString() === uri);
                 if (editor) annotationProvider?.reanchorEditor(editor);
             }, 150));
-
-            // AI_NOTE: 一括変更検知。offなら入口でスキップしタイマーも張らない。
-            const bulkMode = vscode.workspace.getConfiguration("aiCodeGuide").get<string>("autoAnnotateOnAiEdit", "suggest");
-            if (bulkMode === "off") return;
-
-            const bulkChanges: BulkChange[] = e.contentChanges.map(c => ({
-                startLine: c.range.start.line,
-                text: c.text,
-                rangeLineSpan: c.range.end.line - c.range.start.line + 1,
-            }));
-            const result = accumulateBulkChange(bulkEditAccum.get(uri) ?? null, bulkChanges, e.document.lineCount);
-            if (!result) return; // 一括変更なし・既存蓄積も無し → タイマーは張らない
-
-            bulkEditAccum.set(uri, result.lines);
-            const existingBulkTimer = bulkEditTimers.get(uri);
-            if (existingBulkTimer) clearTimeout(existingBulkTimer);
-            bulkEditTimers.set(uri, setTimeout(() => {
-                resolveBulkEdit(uri).catch(err => console.warn(`AI Code Guide: 一括変更検知の確定処理に失敗しました。${err instanceof Error ? err.message : String(err)}`));
-            }, 2000));
         })
     );
-
-    // AI_NOTE: CodeLens「この範囲を解説する」から呼ばれる。行集合は extension 側の蓄積(発火時に削除済み)ではなく
-    // provider の pendingSuggestion が持つため、uri だけ渡して provider 側で解決する(acceptSuggestion)。
-    context.subscriptions.push(
-        vscode.commands.registerCommand("aiCodeGuide.annotateDetectedEdit", async (args: { uri?: string }) => {
-            if (args?.uri) await annotationProvider?.acceptSuggestion(args.uri);
-        })
-    );
-
-    // AI_NOTE: CodeLens「閉じる」から呼ばれる。provider側は現状Step2スタブ(dismissSuggestion)。
-    context.subscriptions.push(
-        vscode.commands.registerCommand("aiCodeGuide.dismissDetectedEdit", (args: { uri?: string }) => {
-            const uriStr = args?.uri;
-            if (!uriStr) return;
-            annotationProvider?.dismissSuggestion(uriStr);
-        })
-    );
-
     // AI_NOTE: #14 保存時のフローチャート更新はサイドバー(MainViewProvider)が自前の onDidSaveTextDocument で行う。
     // ここではインライン解説のみ扱う(編集時クリアの再生成は別経路)。
 
@@ -966,15 +850,13 @@ export function activate(context: vscode.ExtensionContext): void {
     // ポーリングで確定を待つ。
     {
         // AI_NOTE: ① 自動生成OFFでもキャッシュ復元は起動時に走らせたいので、ポーリング自体は常に回して中で分岐する。
-        const autoAnnotateInit = vscode.workspace.getConfiguration("aiCodeGuide").get<boolean>("autoInlineAnnotations", false);
         let attempts = 0;
         const poll = () => {
             attempts++;
             const editor = vscode.window.activeTextEditor
                 ?? vscode.window.visibleTextEditors.find(e => e.document.languageId === "python");
             if (editor && editor.document.languageId === "python") {
-                if (autoAnnotateInit) annotationProvider?.annotateFile(editor);
-                else annotationProvider?.restoreFromCache(editor);
+                void mainViewProvider.prepareDefaultLayers(editor.document, "open");
             } else if (attempts < 20) {
                 setTimeout(poll, 500);
             }

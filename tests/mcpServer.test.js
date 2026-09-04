@@ -60,12 +60,13 @@ function writeNodeLauncher(directory, name, source) {
             response.end(JSON.stringify({ ok: true, views: ["standard", "overview", "project", "diagram", "inline", "trace"], openedViews: openedViewIds.map((id) => ({ id, openedAt: new Date().toISOString() })) }));
             return;
         }
-        if (url.pathname === "/combine") {
+        if (url.pathname === "/prepare") {
             const chunks = [];
             request.on("data", (chunk) => chunks.push(chunk));
             request.on("end", () => {
                 const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-                assert.strictEqual(body.viewIds.length, 4);
+                requests.push(body);
+                assert.deepStrictEqual(body.additions, ["diagram"]);
                 response.writeHead(200, { "Content-Type": "application/json" });
                 response.end(JSON.stringify({
                     ok: true,
@@ -102,6 +103,7 @@ function writeNodeLauncher(directory, name, source) {
                             {
                                 id: "func_2", kind: "function", label: "main()", line: 2, lineEnd: 2,
                                 parent: "class_1", color: "#4fc1ff", description: "固定値1を返す。",
+                                meaningRanges: [{ lineStart: 2, lineEnd: 2 }],
                                 ...(body.expandLines ? {
                                     expanded: true,
                                     expansion: {
@@ -336,21 +338,19 @@ setTimeout(() => fs.writeFileSync(path.join(process.env.AI_CODE_GUIDE_REGISTRY_D
             arguments: {
                 target: "src/main.py · main()",
                 question: "main() は何をする関数？",
-                views: ["標準ビュー", "コード図", "実行トレース", "インライン解説"],
+                views: ["コード図"],
             },
         });
         assert.notStrictEqual(dispatched.isError, true, JSON.stringify(dispatched.content));
         assert.strictEqual(dispatched.structuredContent.dispatch.target, "src/main.py");
         assert.deepStrictEqual(
             dispatched.structuredContent.dispatch.items.map((item) => [item.label, item.status, Boolean(item.url)]),
-            [["標準ビュー", "completed", false], ["コード図", "completed", false], ["実行トレース", "completed", false], ["インライン解説", "completed", false]],
+            [["標準ビュー", "preparing", false], ["インライン解説", "preparing", false], ["コード図", "preparing", false]],
         );
         assert.strictEqual(dispatched.structuredContent.view, "combined");
         assert.strictEqual(dispatched.structuredContent.codexView.view, "combined");
-        assert.ok(requests.some((request) => request.view === "standard"
-            && request.line === 2
-            && JSON.stringify(request.expandLines) === "[2]"
-            && request.activate === false), "the requested function starts with Standard details expanded");
+        assert.ok(!requests.some((request) => request.view === "standard"
+            && Array.isArray(request.expandLines)), "Standard details stay collapsed until the person presses a triangle");
         const combinedLink = dispatched.content.find((item) => item.type === "resource_link");
         assert.strictEqual(combinedLink?.title, "AI Code Guideを開く");
         assert.strictEqual(combinedLink?.uri, dispatched.structuredContent.codexView.url);
@@ -514,15 +514,9 @@ setTimeout(() => fs.writeFileSync(path.join(process.env.AI_CODE_GUIDE_REGISTRY_D
         }
         ok("概要・構成は会話内App、図・インライン・トレースは広いブラウザ表示で返す");
         const canonical = (values) => values.map((value) => JSON.stringify(value)).sort();
-        assert.deepStrictEqual(canonical(requests.slice(0, 5)), canonical([
-            { view: "standard", file: "src/main.py", activate: false },
-            { view: "standard", file: "src/main.py", line: 2, expandLines: [2], activate: false },
-            { view: "diagram", question: "main() は何をする関数？", file: "src/main.py", run: true, activate: false },
-            { view: "trace", file: "src/main.py", run: true, functions: ["main"], activate: false },
-            { view: "inline", file: "src/main.py", run: true, activate: false },
-        ]), "launcher views start independently and the named Standard item is expanded before combination");
-        assert.deepStrictEqual(requests.slice(5), [
-            { view: "standard", file: "src/main.py", line: 2 },
+        assert.deepStrictEqual(requests[0], { file: "src/main.py", question: "main() は何をする関数？", additions: ["diagram"], functions: ["main"] }, "launcher delegates generation lifetime to bridge without awaiting LLM results");
+        assert.deepStrictEqual(requests.slice(1), [
+            { view: "standard", file: "src/main.py", line: 2, backgroundAction: "generate" },
             { view: "standard", file: "src/main.py", expandLines: [2] },
             { view: "overview", file: "src/main.py" },
             { view: "overview", file: "src/main.py", run: true },
@@ -539,7 +533,7 @@ setTimeout(() => fs.writeFileSync(path.join(process.env.AI_CODE_GUIDE_REGISTRY_D
         ].map((request) => ["standard", "diagram", "inline", "trace"].includes(request.view)
             ? { ...request, activate: false }
             : request));
-        assert.strictEqual(requests.slice(0, 5).filter((request) => request.view === "standard" && Array.isArray(request.expandLines)).length, 1);
+        assert.strictEqual(requests.slice(0, 1).filter((request) => request.view === "standard" && Array.isArray(request.expandLines)).length, 0);
         ok("12個の表示・生成・実行ツールを既存ブリッジへ正しく対応付ける");
 
         const focusedJump = await client.callTool({
@@ -548,10 +542,15 @@ setTimeout(() => fs.writeFileSync(path.join(process.env.AI_CODE_GUIDE_REGISTRY_D
         });
         assert.notStrictEqual(focusedJump.isError, true);
         assert.deepStrictEqual(requests.at(-1), {
-            view: "standard", file: "src/main.py", line: 1, focusWindow: true, activate: true,
+            view: "standard", file: "src/main.py", line: 1, focusWindow: true, activate: true, backgroundAction: "generate",
         });
         requests.pop();
         ok("会話内図の明示クリックだけ前面化フラグをVS Codeへ渡す");
+        // AI_NOTE: 保存済みだけの明示要求は生成を許可しない。
+        const cachedStandard = await client.callTool({ name: "show_standard_view", arguments: { file: "src/main.py", savedOnly: true } });
+        assert.notStrictEqual(cachedStandard.isError, true);
+        assert.deepStrictEqual(requests.at(-1), { view: "standard", file: "src/main.py", backgroundAction: "read", activate: false });
+        requests.pop();
 
         const focusedExpansion = await client.callTool({
             name: "expand_standard_items",
@@ -606,7 +605,7 @@ setTimeout(() => fs.writeFileSync(path.join(process.env.AI_CODE_GUIDE_REGISTRY_D
             const nestedResult = await client.callTool({ name: "show_standard_view", arguments: { file: nestedSource } });
             assert.notStrictEqual(nestedResult.isError, true, JSON.stringify(nestedResult.content));
             assert.strictEqual(nestedResult.structuredContent.standard.title, "nested.py");
-            assert.deepStrictEqual(nestedRequests, [{ view: "standard", file: "nested.py", activate: false }]);
+            assert.deepStrictEqual(nestedRequests, [{ view: "standard", file: "nested.py", activate: false, backgroundAction: "generate" }]);
             assert.strictEqual(requests.length, parentRequestCount);
             ok("親repoと子workspaceの両方が対象を含む時は最も具体的なbridgeを選ぶ");
         } finally {
@@ -651,7 +650,7 @@ setTimeout(() => fs.writeFileSync(path.join(process.env.AI_CODE_GUIDE_REGISTRY_D
         const openedTarget = await client.callTool({ name: "show_standard_view", arguments: { file: targetSourceFile } });
         assert.notStrictEqual(openedTarget.isError, true, JSON.stringify(openedTarget.content));
         assert.strictEqual(openedTarget.structuredContent.standard.title, "target.py");
-        assert.deepStrictEqual(requests.at(-1), { view: "standard", file: "src/target.py", activate: false });
+        assert.deepStrictEqual(requests.at(-1), { view: "standard", file: "src/target.py", activate: false, backgroundAction: "generate" });
         requests.pop();
         assert.deepStrictEqual(fs.readFileSync(launchLog, "utf8").trim().split("\n").map(JSON.parse), [[fs.realpathSync.native(targetWorkspace)]]);
         assert.ok(fs.existsSync(path.join(targetWorkspace, ".ai-code-guide", "activation.json")));
@@ -732,7 +731,7 @@ setTimeout(() => fs.writeFileSync(path.join(process.env.AI_CODE_GUIDE_REGISTRY_D
         } finally {
             fs.unlinkSync(outside);
         }
-        assert.strictEqual(requests.length, 20);
+        assert.strictEqual(requests.length, 16);
         ok("不正行・入口なし・相対入口・ワークスペース外ファイルをブリッジ送信前に拒否する");
 
         const missingRelative = await client.callTool({ name: "show_standard_view", arguments: { file: "does/not/exist.py" } });

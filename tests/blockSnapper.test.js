@@ -2,7 +2,7 @@
 // 隙間・重複・逆転を機械的に解消することを確認する。
 // 実行: npm test （内部で npm run compile → node tests/blockSnapper.test.js）
 const assert = require("assert");
-const { snapBlocks, splitSingleBlockByTopLevelStatements } = require("../out/api/blockRangeSnapper.js");
+const { buildDefaultMeaningRanges, snapBlocks, splitSingleBlockByTopLevelStatements } = require("../out/api/blockRangeSnapper.js");
 
 let passed = 0;
 const ok = (name) => { console.log(`  ok - ${name}`); passed++; };
@@ -132,4 +132,32 @@ const blk = (label, lineStart, lineEnd) => ({ label, lineStart, lineEnd, descrip
     ok("短い関数と既存の複数ブロックを変更しない");
 }
 
-console.log(`\n${passed}/9 passed`);
+// 10. 既定背景はLLM説明を持たず、同じAST境界を全行連続の座標だけとして返す
+{
+    const source = [
+        "def calculate_total(prices, coupon=None):",
+        "    subtotal = 0",
+        "    for price in prices:",
+        "        subtotal += price",
+        "    if coupon == 'SAVE10':",
+        "        subtotal *= 0.9",
+        "    return round(subtotal)",
+    ];
+    const stmts = [
+        { start: 0, end: 6 }, { start: 1, end: 1 },
+        { start: 2, end: 3 }, { start: 3, end: 3 },
+        { start: 4, end: 5 }, { start: 5, end: 5 }, { start: 6, end: 6 },
+    ];
+    assert.deepStrictEqual(buildDefaultMeaningRanges(stmts, 0, 6, source), [
+        { lineStart: 0, lineEnd: 1 },
+        { lineStart: 2, lineEnd: 3 },
+        { lineStart: 4, lineEnd: 5 },
+        { lineStart: 6, lineEnd: 6 },
+    ]);
+    assert.deepStrictEqual(buildDefaultMeaningRanges([], 0, 2, source), [
+        { lineStart: 0, lineEnd: 2 },
+    ]);
+    ok("既定背景範囲を説明生成なしで全行連続に構築する");
+}
+
+console.log(`\n${passed}/10 passed`);

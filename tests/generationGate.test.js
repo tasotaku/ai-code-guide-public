@@ -1,0 +1,17 @@
+const assert = require('node:assert/strict');
+const { GenerationGate } = require('../out/api/generationGate');
+const gate = new GenerationGate();
+assert.equal(gate.allow('a', false, 'open'), true);
+gate.edit('a');
+assert.equal(gate.allow('a', true, 'open'), false);
+assert.equal(gate.allow('a', false, 'open'), false, 'autosave and tab return do not permit generation');
+assert.equal(gate.allow('b', false, 'open'), true);
+assert.equal(gate.allow('a', false, 'save'), true);
+gate.stop('a');
+assert.equal(gate.allow('a', false, 'save'), false);
+assert.equal(gate.allow('a', false, 'open'), false);
+assert.equal(gate.allow('a', true, 'explicit'), true);
+const before = gate.revision('a');
+gate.edit('a');
+assert.ok(gate.revision('a') > before, 'editing invalidates issued tickets');
+console.log('generation gate: initial, edit, autosave, save, explicit and stop passed');

@@ -1,6 +1,8 @@
 import { spawn } from "child_process";
 import * as path from "path";
 import { resolveCommand } from "../util/resolveCommand";
+import { extractJavaScriptGraph, extractJavaScriptProjectGraph, javaScriptFuncAtLine, javaScriptStmtSpans, listJavaScriptFunctions } from "./javascriptParser";
+import { languageProfile, SupportedLanguageId } from "./languageSupport";
 
 // AI_NOTE: Python ASTパーサースクリプトのパスを拡張機能ディレクトリからの相対で解決する
 function getParserScript(extensionPath: string): string {
@@ -85,6 +87,9 @@ export interface GraphNode {
     fromComment?: boolean;
     // AI_NOTE: クラスのメソッド/ネストクラスは親クラスのidをparentに持つ。標準ビューで階層描画する
     parent?: string;
+    // AI_NOTE: 背景専用の所有範囲では子本体を除外し、宣言だけを親の文脈に残す。
+    headerEnd?: number;
+    scopeKey?: string;
 }
 
 export interface GraphEdge {
@@ -100,13 +105,17 @@ export interface GraphResult {
     edges: GraphEdge[];
     relationships?: Array<{ from: string; to: string; line: number }>;
     error?: string;
+    backgroundNodes?: GraphNode[];
 }
 
 export async function extractGraph(
     extensionPath: string,
     sourceCode: string,
-    targetFunc = ""
+    targetFunc = "",
+    languageId: SupportedLanguageId = "python"
 ): Promise<GraphResult> {
+    const profile = languageProfile(languageId);
+    if (profile?.family === "javascript") return extractJavaScriptGraph(sourceCode, languageId, targetFunc);
     const script = getParserScript(extensionPath);
     const args = ["graph"];
     if (targetFunc) {
@@ -155,8 +164,11 @@ export async function extractBlocks(
 export async function funcAtLine(
     extensionPath: string,
     sourceCode: string,
-    line: number
+    line: number,
+    languageId: SupportedLanguageId = "python"
 ): Promise<string> {
+    const profile = languageProfile(languageId);
+    if (profile?.family === "javascript") return javaScriptFuncAtLine(sourceCode, languageId, line);
     const script = getParserScript(extensionPath);
     try {
         const stdout = await runPython(script, ["func_at_line", String(line)], sourceCode);
@@ -175,7 +187,9 @@ export interface FuncInfo {
 
 // AI_NOTE: 一括トレースの選択リスト用。トップレベル関数とクラスメソッドを行順で返す。
 // 失敗時は空配列(UI側で一覧を出さない)
-export async function listFunctions(extensionPath: string, sourceCode: string): Promise<FuncInfo[]> {
+export async function listFunctions(extensionPath: string, sourceCode: string, languageId: SupportedLanguageId = "python"): Promise<FuncInfo[]> {
+    const profile = languageProfile(languageId);
+    if (profile?.family === "javascript") return listJavaScriptFunctions(sourceCode, languageId);
     const script = getParserScript(extensionPath);
     try {
         const stdout = await runPython(script, ["functions"], sourceCode);
@@ -200,6 +214,16 @@ export interface SymbolOccurrence {
     end_col: number;
     scope: string;
     context: string;
+    scope_start: number;
+    scope_end: number;
+    is_definition: boolean;
+    /** AI_NOTE: 正確な代入根拠の抽出用。旧parserとの互換性のため省略可、0-based。 */
+    statement_start?: number;
+    statement_end?: number;
+    /** AI_NOTE: 添字・呼出し結果などを呼ぶ動的dispatchは定義を断定しない。 */
+    uncertain_call?: boolean;
+    /** AI_NOTE: 字句scopeのimportまたはstar importが同名builtinを隠す可能性。 */
+    import_shadowed?: boolean;
 }
 
 export async function extractSymbols(extensionPath: string, sourceCode: string): Promise<SymbolOccurrence[]> {
@@ -213,7 +237,9 @@ export async function extractSymbols(extensionPath: string, sourceCode: string):
 }
 
 // AI_NOTE: blockRangeSnapper向けにAST文境界一覧を取得する。失敗時は空配列(呼び出し側でスナップをスキップする)
-export async function getStmtSpans(extensionPath: string, sourceCode: string): Promise<StmtSpan[]> {
+export async function getStmtSpans(extensionPath: string, sourceCode: string, languageId: SupportedLanguageId = "python"): Promise<StmtSpan[]> {
+    const profile = languageProfile(languageId);
+    if (profile?.family === "javascript") return javaScriptStmtSpans(sourceCode, languageId);
     const script = getParserScript(extensionPath);
     try {
         const stdout = await runPython(script, ["stmt_spans"], sourceCode);
@@ -248,10 +274,19 @@ export async function extractProjectGraph(
     projectDir: string
 ): Promise<ProjectGraphResult> {
     const script = getParserScript(extensionPath);
+    const javascriptResult = extractJavaScriptProjectGraph(projectDir);
     try {
         const stdout = await runPython(script, ["project_graph", projectDir], "");
-        return JSON.parse(stdout) as ProjectGraphResult;
+        const pythonResult = JSON.parse(stdout) as ProjectGraphResult;
+        if (pythonResult.error && javascriptResult.error) return pythonResult;
+        return {
+            nodes: [...(pythonResult.error ? [] : pythonResult.nodes), ...(javascriptResult.error ? [] : javascriptResult.nodes)],
+            edges: [...(pythonResult.error ? [] : pythonResult.edges), ...(javascriptResult.error ? [] : javascriptResult.edges)],
+            projectDir: pythonResult.projectDir || javascriptResult.projectDir,
+            dirDescriptions: pythonResult.dirDescriptions,
+        };
     } catch (err) {
+        if (!javascriptResult.error) return javascriptResult;
         const message = err instanceof Error ? err.message : String(err);
         return { nodes: [], edges: [], projectDir, error: message };
     }

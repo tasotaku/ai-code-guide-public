@@ -6,7 +6,7 @@ import { SemanticAnnotation } from "../api/annotationResolver";
 // LLM注釈(contentHashキャッシュ・再生成可・再オープンで復元されない)とは寿命が別＝人間の会話は作り直せないので、
 // URI＋アンカー由来IDで別ファイルに永続する。描画時に reanchorAnnotations で現在座標へ取り直す想定。
 export interface ChatLink {
-    // AI_NOTE: 生成時の確定注釈(kind/anchorText/anchorEndText/id/label/座標ヒント)。座標は編集でズレるが
+    // AI_NOTE: 生成時の確定名称(kind/anchorText/anchorToken/id/label/座標ヒント)。座標は編集でズレるが
     // anchorText と id は「どのコードか」を保つ。描画側が reanchor で座標だけ取り直す。
     annotation: SemanticAnnotation;
     // AI_NOTE: この箇所について質問した過去チャットのセッションID群。同じ箇所へ再質問すると追記されて溜まる(上書きしない)。
@@ -26,7 +26,11 @@ export class ChatLinkStore {
 
     private load(): void {
         try {
-            this.byUri = JSON.parse(fs.readFileSync(this.diskPath, "utf8")) as Record<string, ChatLink[]>;
+            const parsed = JSON.parse(fs.readFileSync(this.diskPath, "utf8")) as Record<string, ChatLink[]>;
+            this.byUri = Object.fromEntries(Object.entries(parsed).map(([uri, links]) => [
+                uri,
+                Array.isArray(links) ? links.filter((link) => link?.annotation?.kind === "symbol") : [],
+            ]));
         } catch {
             this.byUri = {};
         }

@@ -10,7 +10,7 @@ cd ai-code-guide-public
 python bootstrap.py install
 ```
 
-AI-powered code understanding for VS Code — flowchart visualization, project-wide import maps, code diagrams, execution traces, and an interactive symbol dictionary for Python files.
+AI-powered code understanding for VS Code — structure visualization, project-wide import maps, code diagrams, and inline explanations for Python, JavaScript, and TypeScript. Execution traces are available for Python.
 
 This is the public source edition. Building and packaging it does not require an API key, GitHub login, private repository, private registry, or VPN. AI credentials are optional runtime configuration and stay in VS Code SecretStorage or the selected provider CLI.
 
@@ -20,11 +20,11 @@ macOS and Linux source builds may work through the underlying npm scripts, but t
 
 ## Features
 
-- **Flowchart panel**: View an interactive flowchart of any Python file alongside your editor. Click a node to jump to the corresponding code line; click a code line to highlight the corresponding node.
-- **Project view**: Visualize all Python files in your workspace as cards with import dependency arrows. Click a file card to drill into its flowchart.
+- **Flowchart panel**: View an interactive structure map and per-function flowchart for Python, JavaScript, or TypeScript alongside your editor. Click a node to jump to the corresponding code line; click a code line to highlight the corresponding node.
+- **Project view**: Visualize supported code files in your workspace as cards with import dependency arrows. Click a file card to drill into its structure.
 - **AI descriptions**: Generate AI-written descriptions for each file and function. Appears as a subtitle under each card/node.
 - **Granularity control**: Switch between normal and coarse (概要) views, or type natural-language instructions to filter what's shown (e.g. "show only `hash_password`", "more detail").
-- **Interactive symbol dictionary**: Deterministically finds names in the selected Python scope, keeps normal code styling, and shows compact explanations on hover. Ask a follow-up to refine an explanation.
+- **Interactive symbol dictionary**: Finds names in the selected scope, keeps normal code styling, and shows compact explanations on hover. Ask a follow-up to refine an explanation.
 - **Follow-up questions**: Click "💬 質問する" on any annotation to ask a follow-up in the chat panel.
 - **Global context setting**: Tell the AI your background (e.g. "I'm a Python beginner" or "explain in Japanese") to tailor all explanations.
 - **Codex / Claude Code bridge**: Let an external coding agent open the standard, overview, project, diagram, inline, or trace view with one local CLI command. Generated diagram HTML links back to the exact code in VS Code. See [agent usage](docs/agent-usage.md).
@@ -48,7 +48,8 @@ ChatGPTデスクトップ、Codex、Claude Code、Claude Desktopから主要機�
 ## Requirements
 
 - Windows 10/11 for the verified bootstrap path
-- Node.js 20+, Python 3.12+, Git, and VS Code with `code` in `PATH`
+- Node.js 20+, Git, and VS Code with `code` in `PATH`
+- Python 3.12+ when analyzing Python or using execution traces. JavaScript/TypeScript structure analysis is bundled with the extension.
 - 認証は次のどちらか（拡張の設定で切替）:
   - [Anthropic API キー](https://console.anthropic.com/)、または
   - Claude のサブスク（`claude` CLI にログイン済み）— APIキー不要
@@ -131,7 +132,7 @@ The source is publicly visible, but no reuse license is granted. See [LICENSE](L
 
 ### Flowchart (single file)
 
-1. Open a Python file.
+1. Open a Python, JavaScript, or TypeScript file.
 2. Press **Cmd+Alt+V** (Mac) / **Ctrl+Alt+V** (Windows/Linux), or run **AI Code Guide: Show Flowchart** from the Command Palette.
 3. The flowchart panel opens beside your editor and auto-updates on save.
 
@@ -148,20 +149,17 @@ The source is publicly visible, but no reuse license is granted. See [LICENSE](L
 
 1. Open a workspace folder.
 2. Run **AI Code Guide: Show Project Flowchart** from the Command Palette (or click a file card from a single-file flowchart).
-3. All Python files are shown as cards. Arrows indicate import dependencies: **○ (hollow circle)** marks the importing file, **▶** points to the imported file.
+3. All supported code files are shown as cards. Arrows indicate import dependencies: **○ (hollow circle)** marks the importing file, **▶** points to the imported file.
 4. Click a file card to drill into that file's flowchart.
 5. Click **✨ AI説明** to generate AI descriptions for all files. Switch to **概要** view for a semantically grouped overview (requires one LLM call; result is cached).
 
-### Semantic annotations (always-on inline explanations)
+### Name dictionary (hover explanations)
 
-1. Open a Python file and press **Cmd+Alt+E** (Mac) / **Ctrl+Alt+E** (Windows/Linux), or run **AI Code Guide: Explain Block Inline**. (Set `aiCodeGuide.autoInlineAnnotations` to `true` to generate automatically when a file opens.)
-2. The AI picks the spots worth explaining and shows them inline, always visible:
-   - **Token (symbol)**: a dotted underline on the token, with the explanation on a CodeLens line just **below** the code, indented toward the token.
-   - **Block (multi-line)**: the region is framed with a box border, and the explanation flows as a multi-line note in the right margin.
-   - Bugs/problems are shown in red; normal explanations in orange.
-3. Hover any annotated spot for the full detail, and click **💬 質問する** to ask a follow-up in the chat panel.
-4. Press **Cmd+Alt+C** / **Ctrl+Alt+C** (or edit the file) to clear.
-5. The sidebar **Chat** tab also has a control panel: **生成 / 範囲 / クリア** buttons, a **density** dropdown (`minimal / normal / dense` — applied on next generation), an **auto** toggle, and a collapsible list of current annotations with jump (`→`) and follow-up chat (`💬`) shortcuts. The keyboard shortcuts above still work.
+1. Open a Python, JavaScript, or TypeScript file and press **Cmd+Alt+E** (Mac) / **Ctrl+Alt+E** (Windows/Linux), or run **AI Code Guide: Explain Block Inline**. Automatic generation is enabled by default for saved supported files and runs on first display or manual save.
+2. Hover a variable, function, method, or class name to read its explanation. AI Code Guide adds no underline, CodeLens row, block frame, or right-margin note.
+3. Click **💬 質問する** in the hover to ask a follow-up in the chat panel. Execution traces remain visible while the hover is open.
+4. Press **Cmd+Alt+C** / **Ctrl+Alt+C** to clear the saved name dictionary.
+5. The sidebar's **名称辞書** section provides generation, explanation regeneration, selected-range analysis, clear, automatic generation, and display ON/OFF.
 
 ### Global Context
 
@@ -182,21 +180,20 @@ Changing the global context clears the explanation cache so all tooltips and des
 | `aiCodeGuide.claudeCliPath` | `claude` | `useSubscription` ON 時に叩く `claude` のコマンド/絶対パス |
 | `aiCodeGuide.anthropicApiKey` | `""` | Your Anthropic API key |
 | `aiCodeGuide.globalContext` | `""` | Global context prepended to all AI explanations |
-| `aiCodeGuide.autoDescribe` | `true` | Generate AI descriptions automatically when opening a view. Set to `false` to trigger manually via ✨ AI説明 (reduces API cost during testing) |
-| `aiCodeGuide.autoShowOnOpen` | `false` | Auto-open the flowchart panel when a Python file is opened |
+| `aiCodeGuide.autoDescribe` | `false` | Generate AI descriptions automatically when opening a view. Set to `true` to enable automatic generation. |
+| `aiCodeGuide.autoShowOnOpen` | `false` | Auto-open the structure panel when a supported code file is opened |
 | `aiCodeGuide.model` | `gpt-5.6-sol` | Model used for flowchart / description generation |
 | `aiCodeGuide.chatModel` | `gpt-5.6-sol` | Model used for chat / file explanations |
 | `aiCodeGuide.inlineAnnotationModel` | `gpt-5.6-sol` | Model used for semantic annotations and trace preparation |
-| `aiCodeGuide.inlineAnnotationDensity` | `normal` | Criteria depth: `minimal` / `normal` / `dense` / `ultra`（固定件数ではない） |
-| `aiCodeGuide.autoInlineAnnotations` | `false` | Generate semantic annotations automatically when a Python file opens |
+| `aiCodeGuide.autoInlineAnnotations` | `true` | Generate missing name-dictionary explanations for saved supported files on first display or manual save |
 
-### Keybindings (Python editor only)
+### Keybindings (supported code editors)
 
 | Mac | Win/Linux | Command |
 |-----|-----------|---------|
 | `Cmd+Alt+V` | `Ctrl+Alt+V` | Show Flowchart |
-| `Cmd+Alt+E` | `Ctrl+Alt+E` | Explain Block Inline (semantic annotations) |
-| `Cmd+Alt+C` | `Ctrl+Alt+C` | Clear Block Explanations |
+| `Cmd+Alt+E` | `Ctrl+Alt+E` | Generate the name dictionary |
+| `Cmd+Alt+C` | `Ctrl+Alt+C` | Clear the name dictionary display |
 
 Show Project Flowchart has no default keybinding — run it from the Command Palette, or open it by clicking a file card from the single-file flowchart.
 
@@ -206,11 +203,13 @@ Show Project Flowchart has no default keybinding — run it from the Command Pal
 [VSCode Extension (TypeScript)]
   ├── extension.ts              — activation, command registration, event wiring
   ├── flowchart/
-  │   ├── astParser.ts          — shells out to python/ast_parser.py
+  │   ├── astParser.ts          — shared analysis contract and language dispatcher
+  │   ├── javascriptParser.ts   — JavaScript/TypeScript AST adapter
+  │   ├── languageSupport.ts    — supported-language registry and capabilities
   │   ├── flowchartCache.ts     — caches parsed graphs per file
   │   └── mermaid.ts            — renders the graph JSON into Mermaid + CSP'd webview HTML
   ├── inline/
-  │   └── blockExplanationProvider.ts — semantic annotations (underline + below-line CodeLens, boxed blocks + sidenote, hover), cache
+  │   └── blockExplanationProvider.ts — symbol-only name hover and cache
   ├── view/
   │   ├── mainViewProvider.ts   — sidebar Webview: flowchart + project view + chat + settings panes
   │   ├── chatStore.ts          — follow-up chat state per annotation
@@ -225,6 +224,8 @@ Show Project Flowchart has no default keybinding — run it from the Command Pal
   — Parses Python source via stdlib `ast`
   — Commands: `flowchart <granularity> [func]` | `project_graph`
   — Outputs JSON to stdout
+
+Execution traces remain Python-only. Structure, overview, project, diagram, inline explanation, and chat views share the same UI and data contract across all supported languages.
 ```
 
 ## Development

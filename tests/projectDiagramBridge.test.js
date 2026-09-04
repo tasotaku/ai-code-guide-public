@@ -64,6 +64,7 @@ function request(url, method = "GET", body) {
                         ],
                         items: [{ id: "class-1", kind: "class", label: "class Runner", line: 1, lineEnd: 3 }, {
                             id: "method-2", kind: "function", label: "main", parent: "class-1", line: 2, lineEnd: 3,
+                            meaningRanges: [{ lineStart: 2, lineEnd: 3 }],
                             ...(expanded ? {
                                 expanded: true,
                                 expansion: {
@@ -403,7 +404,7 @@ function request(url, method = "GET", body) {
         assert.ok(traceView.body.includes("token-keyword"));
         assert.ok(traceView.body.includes("token-type"));
         assert.ok(traceView.body.includes(".code-token-match"));
-        assert.ok(traceView.body.includes('document.documentElement.dataset.codeSurface="shared-v1"'));
+        assert.ok(traceView.body.includes('document.documentElement.dataset.codeSurface="shared-v2"'));
         assert.ok(!traceView.body.includes(".trace-code-pane .trace-row.semantic-unit"));
         assert.ok(!traceView.body.includes('codeRow.style.setProperty("--unit-color",unitColor)'));
         assert.ok(traceView.body.includes('"color":"#c586c0"'));
@@ -478,7 +479,7 @@ function request(url, method = "GET", body) {
         assert.ok(inlineView.body.includes('"前の説明に戻す"'));
         assert.ok(inlineView.body.includes('fetch("/view/"+viewId+"/ask"'));
         assert.ok(inlineView.body.includes(".code-token-match"));
-        assert.ok(inlineView.body.includes('document.documentElement.dataset.codeSurface="shared-v1"'));
+        assert.ok(inlineView.body.includes('document.documentElement.dataset.codeSurface="shared-v2"'));
         assert.ok(inlineView.body.includes("span.dataset.codeToken=token"));
         assert.ok(inlineView.body.includes('document.addEventListener("dblclick"'));
         assert.ok(inlineView.body.includes("range.selectNodeContents(target)"));
@@ -579,7 +580,7 @@ function request(url, method = "GET", body) {
         assert.ok(diagramView.body.includes('data-file="src/main.py"'));
         assert.ok(diagramView.body.includes('data-line="2"'));
         assert.ok(diagramView.body.includes("class Runner:"));
-        assert.ok(diagramView.body.includes('document.documentElement.dataset.codeSurface="shared-v1"'));
+        assert.ok(diagramView.body.includes('document.documentElement.dataset.codeSurface="shared-v2"'));
         assert.ok(diagramView.body.includes('document.querySelector(".diagram-pane").addEventListener("click"'));
         assert.ok(diagramView.body.includes('event.target.closest(".pd-flow-shape")'));
         assert.ok(diagramView.body.includes('event.target.closest(".pd-detail-jump,.pd-node-jump")'));
@@ -632,7 +633,8 @@ function request(url, method = "GET", body) {
         assert.ok(standardView.body.includes(".token-function{color:var(--function)}"));
         assert.ok(standardView.body.includes(".token-type{color:var(--type)}"));
         assert.ok(standardView.body.includes(".token-name{color:var(--name)}"));
-        assert.ok(standardView.body.includes('const types=new Set("bool bytes dict'));
+        assert.ok(standardView.body.includes('const types=new Set("Array bigint bool'));
+        assert.ok(standardView.body.includes("catch class const"));
         assert.ok(standardView.body.includes('cls="token-function"'));
         assert.ok(standardView.body.includes('aria-label="VS Code標準タブと同じカード一覧"'));
         assert.ok(standardView.body.includes("▼ クラスを開く"));
@@ -665,17 +667,17 @@ function request(url, method = "GET", body) {
         assert.ok(standardView.body.includes("white-space:pre;user-select:text;cursor:text"));
         assert.ok(standardView.body.includes(".code-token-match"));
         assert.ok(standardView.body.includes("span.dataset.codeToken=token"));
-        assert.ok(standardView.body.includes('document.documentElement.dataset.codeSurface="shared-v1"'));
+        assert.ok(standardView.body.includes('document.documentElement.dataset.codeSurface="shared-v2"'));
         assert.ok(standardView.body.includes('codeSurface.appendPython(code,entry.text)'));
         assert.ok(standardView.body.includes('" の説明を展開しました。",false,2400'));
         assert.ok(standardView.body.includes('"分解できませんでした。",true,6000'));
-        assert.ok(standardView.body.includes('showRangeFill=inside&&active?.kind!=="class"'));
-        assert.ok(standardView.body.includes('(showRangeFill?" selected":"")'));
+        assert.ok(standardView.body.includes('(inside&&meaning?" selected":"")'));
+        assert.ok(standardView.body.includes('meaning?.color||"transparent"'), "uncached source never falls back to definition colors");
         assert.ok(standardView.body.includes("scrollIntoView({block:\"center\",inline:\"nearest\"})"));
         assert.ok(standardView.body.includes(".label{min-width:0;flex:1;overflow-wrap:anywhere;white-space:normal"));
         assert.ok(!standardView.body.includes(".label{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis"));
         assert.ok(standardView.body.includes('var(--unit-color) 12%,transparent'));
-        assert.ok(standardView.body.includes('var(--unit-color) 20%,transparent'));
+        assert.ok(standardView.body.includes('box-shadow:inset 2px 0 var(--unit-color)'), 'selection marks the edge without overwriting semantic fill');
         const vscodeStandardSource = fs.readFileSync(path.join(__dirname, "../src/view/mainViewProvider.ts"), "utf8");
         for (const sharedTone of ["0.15", "22%", "8%", "32%", "12%", "0.06"]) {
             assert.ok(vscodeStandardSource.includes(sharedTone), `VS Code標準タブに共通配色 ${sharedTone} がある`);
@@ -722,16 +724,27 @@ function request(url, method = "GET", body) {
         assert.ok(combinedView.body.includes('const appendPython=(parent,text,beforeContext="",afterContext="")=>codeSurface.appendPython(parent,text,beforeContext,afterContext)'));
         assert.ok(combinedView.body.includes("appendPython(anchor,text.slice(start,end),text.slice(0,start),text.slice(end))"));
         assert.strictEqual(combinedView.status, 200);
+        assert.ok(!combinedView.body.includes('class="eyebrow"'), "combined header omits redundant product branding");
+        assert.ok(combinedView.body.includes("min-height:38px;padding:5px 8px 5px 13px"), "single shared header preserves vertical code space");
         for (const marker of [
-            "AI CODE GUIDE", "サイドバーをしまう", "サイドバーを開く", "標準ビュー", "コード図",
+            "サイドバーをしまう", "サイドバーを開く", "標準ビュー", "コード図",
             ".source-row.in-unit", "trace-note", "symbol-anchor", "fetch(\"/view/\"+viewId+\"/expand\"",
             "fetch(\"/view/\"+viewId+\"/ask\"",
         ]) assert.ok(combinedView.body.includes(marker), `combined view includes ${marker}`);
         assert.ok(combinedView.body.includes("mainが固定値を返す。"));
         assert.ok(combinedView.body.includes('blockColors=["#4ec9b0","#d7ba7d","#c586c0"'));
         assert.ok(combinedView.body.includes("--pd-line:#d7ba7d"), "dark unified diagram keeps edges and arrowheads visible");
-        assert.ok(combinedView.body.includes("item.expansion?.blocks"));
+        assert.ok(combinedView.body.includes("item.meaningRanges"));
         assert.ok(!combinedView.body.includes("trace-hit"), "trace values must not add a dot beside the line number");
+        assert.ok(combinedView.body.includes('class="panel trace-panel"'), "trace shares the sidebar frame");
+        assert.ok(combinedView.body.includes('class="header-tools"><div class="tabs" id="tabs"'), "shared-view tabs stay in the common header");
+        assert.ok(!combinedView.body.includes("sidebar-head"), "sidebar content starts level with code content");
+        assert.ok(combinedView.body.includes('addTab("trace","実行トレース")'), "trace is a sidebar tab");
+        assert.ok(!combinedView.body.includes(".source-lines{display:grid;grid-template-columns"), "source uses the full code column");
+        assert.ok(combinedView.body.includes(".source-pane{min-width:0;min-height:0;overflow:auto"), "both panes own their horizontal scroll");
+        assert.ok(combinedView.body.includes("height:var(--line-height);padding:0 12px;color:var(--muted);white-space:pre"), "long trace notes stay on one fixed-height row");
+        assert.ok(!combinedView.body.includes("trace-line"), "aligned trace does not need duplicate line numbers");
+        assert.ok(combinedView.body.includes("const syncVertical=(from,to)=>"), "independent panes keep corresponding rows vertically aligned");
         assert.ok(combinedView.body.includes("値を返す"), "prepared standard details start expanded");
         const combinedState = JSON.parse((await request(`${combinedBody.codexView.url}/state`)).body);
         assert.strictEqual(combinedState.view, "combined");
